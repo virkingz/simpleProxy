@@ -62,6 +62,8 @@ const DEFAULT_PREFIXES = ['/web', '/ui', '/www', '/h5', '/admin', '/public', '/d
 const STATIC_RE = /\.(?:js|mjs|cjs|css|map|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|json|txt|wasm)(?:[?#]|$)/i;
 // 只对真正的静态文件做 404 探测，避免把 /api/config.json 这类接口也算进去
 const PROBE_ASSET_RE = /\.(?:js|mjs|cjs|css|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|wasm)(?:[?#]|$)/i;
+// 这些段不是「部署前缀」，不能当作 base 候选
+const SKIP_PREFIX_RE = /^(?:static|assets?|js|css|img|images?|fonts?|media|public|dist|build|login|index\.html?|default\.html?|home|api|favicon\.ico)$/i;
 
 /* ------------------------------------------------------------------ *
  * 数据层（SQLite，零原生依赖）
@@ -293,9 +295,20 @@ function prepareProxyReq(proxyReq, req, target) {
   if (cookies) proxyReq.setHeader('Cookie', cookies);
   else proxyReq.removeHeader('Cookie');
 
-  // 让上游返回未压缩内容，方便对 HTML 注入退出按钮
-  proxyReq.removeHeader('accept-encoding');
-  proxyReq.setHeader('accept-encoding', 'identity');
+  // 需要「解压后注入退出按钮」的只有 HTML；JS/CSS 即使压缩也能解码后重写。
+  // 因此只对页面请求强制 identity —— 很多嵌入式设备/精简 Nginx 只提供
+  // .js.gz / .css.br 预压缩文件，客户端不声明 gzip/br 时直接回 404（len=146）。
+  // 静态资源必须原样透传浏览器的 accept-encoding，否则就是「页面能开、JS 全 404」。
+  const isAsset0 = PROBE_ASSET_RE.test(String(req.originalUrl || req.url || ''));
+  if (!isAsset0) {
+    proxyReq.removeHeader('accept-encoding');
+    proxyReq.setHeader('accept-encoding', 'identity');
+  } else {
+    // 已知该目标需要压缩协商才能取到静态资源时，兜底补上 gzip
+    const ae = req.headers['accept-encoding'] || (target && target.preferGzip ? 'gzip, deflate, br' : '');
+    if (ae) proxyReq.setHeader('accept-encoding', String(ae));
+    else proxyReq.removeHeader('accept-encoding');
+  }
 
   // 抹掉会把「网关域名」暴露给目标的头。很多内网服务（Lucky / nginx）
   // 据此做防盗链、Host 白名单或 CSRF 校验，命中即返回 403。
@@ -479,15 +492,21 @@ function bufferToRes(statusCode, headers, buf) {
 
 // 直接用 node:http(s) 发一次「干净」的 GET 去目标探测路径。
 // 不经过网关那套请求头加工，因此也能绕开设备对 Origin / Sec-Fetch 的校验。
-function rawFetch(target, path, req) {
-  return new Promise((resolve) => {
+// opts.follow: 跟随重定向次数（默认 0，探测入口页时用 3）。
+// opts.protocol: 覆盖协议（用于 http/https 交叉探测）。
+// opts.headers: 额外/覆盖的请求头。
+function rawFetch(target, path, req, opts = {}) {
+  const follow = Number.isInteger(opts.follow) ? opts.follow : 0;
+  const proto = opts.protocol || target.protocol;
+
+  const once = (p, left) => new Promise((resolve) => {
     let settled = false;
     const done = (v) => { if (!settled) { settled = true; resolve(v); } };
-    const mod = target.protocol === 'https' ? https : http;
-    const opts = {
+    const mod = proto === 'https' ? https : http;
+    const base = {
       host: target.host,
       port: target.port,
-      path,
+      path: p,
       method: 'GET',
       rejectUnauthorized: false,
       headers: {
@@ -495,19 +514,34 @@ function rawFetch(target, path, req) {
         'accept-encoding': 'identity',
         accept: (req && req.headers && req.headers.accept) || '*/*',
         'user-agent': (req && req.headers && req.headers['user-agent']) || 'simpleproxy-probe',
+        ...(opts.headers || {}),
       },
     };
-    const r = mod.request(opts, (up) => {
+    const r = mod.request(base, (up) => {
+      const code = up.statusCode || 200;
+      const loc = up.headers['location'];
+      // 3xx 且有 Location：跟随（仅同源，避免探到外站）
+      if (loc && code >= 300 && code < 400 && left > 0) {
+        up.resume();
+        let np = null;
+        try {
+          const u = new URL(loc, `${proto}://${target.host}:${target.port}`);
+          if (u.hostname === target.host) np = u.pathname + u.search;
+        } catch {}
+        if (np) return once(np, left - 1).then(done);
+        return done({ statusCode: code, headers: up.headers, body: Buffer.alloc(0), path: p, location: loc });
+      }
       const chunks = [];
       up.on('data', (c) => chunks.push(c));
       up.on('end', () => {
         const body = Buffer.concat(chunks);
         done({
-          statusCode: up.statusCode || 200,
+          statusCode: code,
           headers: up.headers,
           body,
-          path,
-          stream: bufferToRes(up.statusCode || 200, up.headers, body),
+          path: p,
+          location: loc,
+          stream: bufferToRes(code, up.headers, body),
         });
       });
       up.on('error', () => done(null));
@@ -516,22 +550,23 @@ function rawFetch(target, path, req) {
     r.on('error', () => done(null));
     r.end();
   });
+
+  return once(path, follow);
 }
 
 // 从目标根页面推断它真实挂在哪个前缀下（跳转 Location / <base> / 资源 src）
 async function rootPrefixes(target) {
-  const r = await rawFetch(target, '/', null);
+  // follow: 3 —— 入口常是 302 → /login，不跟随就拿不到真正引用资源的那个页面
+  const r = await rawFetch(target, '/', null, { follow: 3 });
   if (!r) return [];
   const out = [];
-  const skip = /^(?:login|index\.html?|default\.html?|home|api|favicon\.ico)$/i;
   const add = (seg) => {
-    if (!seg || skip.test(String(seg))) return;
+    if (!seg || SKIP_PREFIX_RE.test(String(seg))) return;
     const p = '/' + String(seg).replace(/^\/+|\/+$/g, '');
     if (p !== '/' && !out.includes(p)) out.push(p);
   };
-  const loc = r.headers['location'];
-  if (loc) {
-    try { add(new URL(loc, targetOrigin(target)).pathname.split('/').filter(Boolean)[0]); } catch {}
+  if (r.location) {
+    try { add(new URL(r.location, targetOrigin(target)).pathname.split('/').filter(Boolean)[0]); } catch {}
   }
   const text = r.body.toString('utf8');
   const bm = /<base[^>]+href\s*=\s*["']\/?([^"'\/?#]+)\//i.exec(text);
@@ -544,9 +579,8 @@ async function rootPrefixes(target) {
 
 async function buildPrefixCandidates(target, req, path) {
   const out = [];
-  const skip = /^(?:login|index\.html?|default\.html?|home|api|favicon\.ico)$/i;
   const add = (seg) => {
-    if (!seg || skip.test(String(seg))) return;
+    if (!seg || SKIP_PREFIX_RE.test(String(seg))) return;
     const p = '/' + String(seg).replace(/^\/+|\/+$/g, '');
     if (p === '/' || path.startsWith(p + '/') || out.includes(p)) return;
     out.push(p);
@@ -568,17 +602,28 @@ async function probeSubPath(target, req) {
   const kept = query.replace(/^\?/, '').split('&').filter(p => p && !p.startsWith(BUST_PARAM + '='));
   const suffix = kept.length ? '?' + kept.join('&') : '';
   const candidates = await buildPrefixCandidates(target, req, path);
-  if (!candidates.length) return null;
-  const results = await Promise.all(candidates.map(async (prefix) => {
-    const p = joinBase(prefix, path) + suffix;
-    const r = await rawFetch(target, p, req);
+  const accepts = ['gzip, deflate, br', 'identity'];
+  const attempts = [];
+  // 前缀候选 × accept-encoding：既找路径前缀，也验证「是否只是压缩协商问题」
+  for (const prefix of candidates) {
+    for (const ae of accepts) {
+      attempts.push({ prefix, full: joinBase(prefix, path) + suffix, ae });
+    }
+  }
+  if (attempts.length === 0) return null;
+  const results = await Promise.all(attempts.map(async (a) => {
+    const r = await rawFetch(target, a.full, req, { headers: { 'accept-encoding': a.ae } });
     if (!r || r.statusCode < 200 || r.statusCode >= 300) return null;
     // SPA 的 catch-all 常对任意路径回 200 + text/html，那种不是真资源
     if (/text\/html/i.test(String(r.headers['content-type'] || ''))) return null;
-    r.prefix = prefix;
+    r.prefix = a.prefix;
+    r.acceptEncoding = a.ae;
     return r;
   }));
-  return results.find(Boolean) || null;
+  const hit = results.find(Boolean) || null;
+  // 若同一 URL 只有带 gzip 才 200，说明上游依赖压缩协商：记下偏好压缩
+  if (hit) target.preferGzip = /gzip|br|deflate/i.test(hit.acceptEncoding);
+  return hit;
 }
 
 async function handleStaticFallback(proxyRes, req, res, target, headers, status) {
@@ -761,6 +806,93 @@ app.post(BASE + '/api/exit', (req, res) => {
   if (sid) sessions.delete(sid);
   res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
   res.json({ ok: true });
+});
+
+/* --- 诊断：把上游真相一次打出来（需已通过 Token） ---
+ * GET /_gate/api/diag[?target=1.2.3.4:443]
+ * 返回：入口页真实落点、入口页引用的资源、每个资源在各前缀/协议下的真实状态。
+ * 用于定位「上游 404」到底是路径前缀问题、协议问题，还是资源本身不存在。
+ */
+app.get(BASE + '/api/diag', async (req, res) => {
+  const s = getSession(req);
+  if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
+  const t = (req.query.target && normalizeTarget(req.query.target)) || s.target;
+  if (!t) return res.status(400).json({ ok: false, error: '未设置目标' });
+
+  const refs = new Set();
+  const { path: cur } = splitUrl(String(req.query.path || '/login'));
+  const entryPaths = ['/', cur, '/login', '/index.html'];
+  const seenEntry = [];
+
+  for (const p of [...new Set(entryPaths)]) {
+    const r = await rawFetch(t, p, null, { follow: 3 });
+    if (!r) { seenEntry.push({ path: p, error: 'unreachable' }); continue; }
+    seenEntry.push({
+      path: p, landedOn: r.path, status: r.statusCode,
+      server: r.headers.server || null,
+      contentType: r.headers['content-type'] || null,
+      location: r.location || null,
+      bytes: r.body.length,
+    });
+    if (/text\/html/i.test(String(r.headers['content-type'] || ''))) {
+      const html = r.body.toString('utf8');
+      const re = /(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+      let m;
+      while ((m = re.exec(html))) {
+        const u = m[1].trim();
+        if (!u || /^(?:data:|javascript:|mailto:|blob:|#)/i.test(u)) continue;
+        if (/^https?:\/\//i.test(u)) { try { const x = new URL(u); refs.add(x.pathname + x.search); } catch {} }
+        else if (u.startsWith('/')) refs.add(u);
+      }
+    }
+  }
+
+  const rel = [...refs].slice(0, 6);
+  const prefixes = ['', ...DEFAULT_PREFIXES.slice(0, 3)];
+  const protos = t.protocol === 'https' ? ['https', 'http'] : ['http', 'https'];
+  const probes = [];
+  outer:
+  for (const rp of rel) {
+    const { path: rpPath, query: rpQuery } = splitUrl(rp);
+    const segs = rpPath.split('/').filter(Boolean);
+    const variants = new Set([rpPath]);
+    if (segs.length > 1 && ['static', 'assets'].includes(segs[0])) variants.add('/' + segs.slice(1).join('/'));
+    for (const v of variants) {
+      for (const pf of prefixes) {
+        for (const proto of protos) {
+          for (const ae of ['gzip, deflate, br', 'identity']) {
+            const full = joinBase(pf, v) + rpQuery;
+            const key = proto + ' ' + full + ' [' + ae + ']';
+            if (probes.some((x) => x.key === key)) continue;
+            const r = await rawFetch(t, full, null, { protocol: proto, headers: { 'accept-encoding': ae } });
+            probes.push({
+              key,
+              proto, url: full, acceptEncoding: ae,
+              status: r ? r.statusCode : null,
+              server: r ? (r.headers.server || null) : null,
+              contentType: r ? (r.headers['content-type'] || null) : null,
+              contentEncoding: r ? (r.headers['content-encoding'] || null) : null,
+              bytes: r ? r.body.length : null,
+            });
+            if (probes.length >= 48) break outer;
+          }
+        }
+      }
+    }
+  }
+
+  const winner = probes.find((p) => p.status >= 200 && p.status < 300 && !/text\/html/i.test(String(p.contentType || '')));
+  res.json({
+    ok: true,
+    target: { protocol: t.protocol, host: t.host, port: t.port, base: t.base },
+    entry: seenEntry,
+    references: rel,
+    probes,
+    winner: winner || null,
+    hint: winner
+      ? `已找到可用组合：${winner.proto} ${winner.url} [accept-encoding: ${winner.acceptEncoding}]。若是前缀差异，把 "${winner.url.split('/').slice(0, 2).join('/')}/" 填进登录地址的路径。`
+      : '所有组合都失败：说明这些文件在该地址下确实不存在（可能是另一端口/另一台机器，或需要先登录鉴权）。请核对浏览器直连时的完整地址。',
+  });
 });
 
 /* --- 站点列表 --- */
