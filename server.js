@@ -1,10 +1,12 @@
 import express from 'express';
 import httpProxy from 'http-proxy';
 import http from 'node:http';
+import https from 'node:https';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -41,6 +43,27 @@ const BUST_CDN_CACHE = process.env.BUST_CDN_CACHE !== 'false';
 const BUST_PARAM = '_gw';
 
 /* ------------------------------------------------------------------ *
+ * 通用子路径（base path）代理
+ *
+ * 很多内网服务不是挂在 / 根，而是挂在 /wangzhang/、/web/、/ui/ 这类
+ * 前缀下，或者 HTML 里写死根级 /static/... 而文件其实在别的目录。
+ * 旧版 normalizeTarget 直接丢掉了 URL 里的 pathname，导致这类服务
+ * 一律 404（且 404 来自上游，不是网关、也不是 CDN）。
+ *
+ * 两层处理：
+ *  ① 显式：登录地址带路径时保留为 base，所有出站请求自动补上
+ *     （已经带 base 的路径不会重复叠加）；Location 去掉 base，避免前缀越叠越长。
+ *  ② 自动：静态资源在上游 404 时，探测目标真实前缀并即时回源；
+ *     命中后只对该会话的「静态资源」请求补前缀，不影响页面/API。
+ * ------------------------------------------------------------------ */
+const AUTO_SUBPATH = process.env.AUTO_SUBPATH !== 'false';
+const PROBE_TIMEOUT_MS = Math.max(200, Math.min(5000, parseInt(process.env.PROBE_TIMEOUT_MS || '1200', 10) || 1200));
+const DEFAULT_PREFIXES = ['/web', '/ui', '/www', '/h5', '/admin', '/public', '/dist', '/frontend', '/console', '/manage'];
+const STATIC_RE = /\.(?:js|mjs|cjs|css|map|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|json|txt|wasm)(?:[?#]|$)/i;
+// 只对真正的静态文件做 404 探测，避免把 /api/config.json 这类接口也算进去
+const PROBE_ASSET_RE = /\.(?:js|mjs|cjs|css|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|wasm)(?:[?#]|$)/i;
+
+/* ------------------------------------------------------------------ *
  * 数据层（SQLite，零原生依赖）
  * ------------------------------------------------------------------ */
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -53,31 +76,55 @@ db.exec(`
     protocol     TEXT    NOT NULL DEFAULT 'http',
     host         TEXT    NOT NULL,
     port         INTEGER,
+    base         TEXT    NOT NULL DEFAULT '',
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER,
-    UNIQUE(protocol, host, port)
+    UNIQUE(protocol, host, port, base)
   );
 `);
 
-// 兼容旧库：老版本没有 note 列，平滑升级
+// 兼容旧库：老版本没有 note / base 列，且唯一键不含 base，平滑升级
 {
   const cols = db.prepare('PRAGMA table_info(sites)').all().map((c) => c.name);
-  if (!cols.includes('note')) db.exec("ALTER TABLE sites ADD COLUMN note TEXT NOT NULL DEFAULT ''");
+  const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sites'").get();
+  const ddl = idx ? String(db.prepare("SELECT sql FROM sqlite_master WHERE name='sites'").get()?.sql || '') : '';
+  if (!cols.includes('note') || !cols.includes('base') || !/UNIQUE\s*\(\s*protocol\s*,\s*host\s*,\s*port\s*,\s*base\s*\)/i.test(ddl)) {
+    const noteExpr = cols.includes('note') ? 'note' : "''";
+    const baseExpr = cols.includes('base') ? 'base' : "''";
+    db.exec(`
+      ALTER TABLE sites RENAME TO sites_old;
+      CREATE TABLE sites (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT    NOT NULL,
+        note         TEXT    NOT NULL DEFAULT '',
+        protocol     TEXT    NOT NULL DEFAULT 'http',
+        host         TEXT    NOT NULL,
+        port         INTEGER,
+        base         TEXT    NOT NULL DEFAULT '',
+        created_at   INTEGER NOT NULL,
+        last_used_at INTEGER,
+        UNIQUE(protocol, host, port, base)
+      );
+      INSERT INTO sites (id, name, note, protocol, host, port, base, created_at, last_used_at)
+        SELECT id, name, ${noteExpr}, protocol, host, port, ${baseExpr}, created_at, last_used_at FROM sites_old;
+      DROP TABLE sites_old;
+    `);
+  }
 }
 
 const stmt = {
   list: db.prepare('SELECT * FROM sites ORDER BY last_used_at DESC, id DESC'),
   get: db.prepare('SELECT * FROM sites WHERE id = ?'),
   upsert: db.prepare(`
-    INSERT INTO sites (name, note, protocol, host, port, created_at, last_used_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(protocol, host, port)
+    INSERT INTO sites (name, note, protocol, host, port, base, created_at, last_used_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(protocol, host, port, base)
     DO UPDATE SET name = excluded.name, note = excluded.note, last_used_at = excluded.last_used_at
   `),
   touch: db.prepare('UPDATE sites SET last_used_at = ? WHERE id = ?'),
-  update: db.prepare('UPDATE sites SET name = ?, note = ? WHERE id = ?'),
+  update: db.prepare('UPDATE sites SET name = ?, note = ?, base = ? WHERE id = ?'),
   del: db.prepare('DELETE FROM sites WHERE id = ?'),
-  find: db.prepare('SELECT * FROM sites WHERE protocol = ? AND host = ? AND port = ?'),
+  find: db.prepare('SELECT * FROM sites WHERE protocol = ? AND host = ? AND port = ? AND base = ?'),
 };
 
 /* ------------------------------------------------------------------ *
@@ -142,13 +189,63 @@ function normalizeTarget(input) {
   let port = u.port ? parseInt(u.port, 10) : u.protocol === 'https:' ? 443 : 80;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
 
+  // 保留 URL 里的路径作为 base：/wangzhang/ 、/web/ui/ 这类子路径部署
+  let base = '';
+  try { base = decodeURIComponent(u.pathname || '/'); } catch { return null; }
+  if (base.includes('..') || base.includes('\\')) return null;
+  base = base.replace(/\/+/g, '/');
+  if (!base.startsWith('/')) base = '/' + base;
+  // 最后一段看起来是文件名/页面名时当作入口页，只保留目录部分
+  if (!base.endsWith('/')) base = base.replace(/\/[^/]*$/, '/');
+  if (base === '/' || base === '') base = '';
+  if (base && !/^\/[A-Za-z0-9._~%\-/]*$/.test(base)) return null;
+
   const protocol = u.protocol.replace(':', '');
-  return { protocol, host, port, key: `${protocol}//${host}:${port}` };
+  return {
+    protocol, host, port, base,
+    assetPrefix: '',                 // 自动探测到的静态资源前缀（仅会话内有效）
+    key: `${protocol}//${host}:${port}${base}`,
+  };
 }
 
 function targetOrigin(t) {
   const isDefault = (t.protocol === 'http' && t.port === 80) || (t.protocol === 'https' && t.port === 443);
   return `${t.protocol}://${t.host}${isDefault ? '' : ':' + t.port}`;
+}
+
+/* ---- 网关根路径 <-> 目标 base 的双向映射 ---- */
+function splitUrl(url) {
+  const i = url.indexOf('?');
+  return i < 0
+    ? { path: url || '/', query: '' }
+    : { path: url.slice(0, i) || '/', query: url.slice(i) };
+}
+
+function joinBase(base, path) {
+  const b = String(base || '').replace(/\/+$/, '');
+  if (!b) return path;
+  if (path === b || path === b + '/' || path.startsWith(b + '/')) return path;
+  return b + (path.startsWith('/') ? path : '/' + path);
+}
+
+function stripBase(pathname, base) {
+  const b = String(base || '').replace(/\/+$/, '');
+  if (!b) return pathname;
+  if (pathname === b) return '/';
+  if (pathname.startsWith(b + '/')) return '/' + pathname.slice(b.length + 1);
+  return pathname;
+}
+
+// 在 proxy.web 之前把 req.url 改写成目标侧真实路径。
+// base 作用于所有请求；assetPrefix 只作用于静态资源（自动探测结果），
+// 避免把 /login、/api/... 也带偏。
+function mapOutgoingUrl(req, target) {
+  const { path, query } = splitUrl(req.url);
+  let p = path;
+  if (target.base) p = joinBase(target.base, p);
+  else if (target.assetPrefix && PROBE_ASSET_RE.test(path)) p = joinBase(target.assetPrefix, p);
+  req.url = p + query;
+  return req.url;
 }
 
 /* ------------------------------------------------------------------ *
@@ -204,12 +301,25 @@ function prepareProxyReq(proxyReq, req, target) {
   // 据此做防盗链、Host 白名单或 CSRF 校验，命中即返回 403。
   // STRIP_CLIENT_HEADERS=false 可关闭，用于 A/B 对比定位问题。
   if (STRIP_CLIENT_HEADERS) {
+    // 静态资源：尽量还原「浏览器直连目标」时的请求头。
+    // 浏览器请求 .js/.css 时不会带 Origin，也一定会带 Sec-Fetch-*；
+    // 旧实现无条件注入 Origin、剥掉 Sec-Fetch-*，部分嵌入式设备
+    // （iKuai 等）会把它判成跨域接口请求，静态资源直接回 404。
+    const isAsset = STATIC_RE.test(String(req.originalUrl || req.url || ''));
     for (const h of Object.keys(proxyReq.getHeaders())) {
-      if (/^(x-forwarded-|forwarded$|sec-fetch-)/i.test(h)) proxyReq.removeHeader(h);
+      if (/^(x-forwarded-|forwarded$)/i.test(h)) proxyReq.removeHeader(h);
+      if (/^sec-fetch-/i.test(h) && !isAsset) proxyReq.removeHeader(h);
     }
-    // 比「删除」更稳：把来源伪装成目标自身，兼容要求 Referer 必须同源的防盗链
     const tOrigin = targetOrigin(target);
-    proxyReq.setHeader('origin', tOrigin);
+    if (isAsset) {
+      proxyReq.removeHeader('origin');
+      for (const [h, v] of Object.entries(req.headers)) {
+        if (/^sec-fetch-/i.test(h) && v !== undefined) proxyReq.setHeader(h, v);
+      }
+    } else {
+      // 比「删除」更稳：把来源伪装成目标自身，兼容要求 Referer 必须同源的防盗链
+      proxyReq.setHeader('origin', tOrigin);
+    }
     const ref = String(req.headers.referer || '');
     let refPath = '/';
     try { if (ref) refPath = new URL(ref).pathname + new URL(ref).search; } catch {}
@@ -262,7 +372,12 @@ function handleProxyRes(proxyRes, req, res, target) {
   const enc = String(headers['content-encoding'] || '').toLowerCase();
   const status = proxyRes.statusCode || 200;
   if (PROXY_LOG) {
-    console.log(`[proxy] ${req.method} ${req.originalUrl} -> ${status} (${ctype || '-'}, body ${proxyRes.headers['content-length'] ?? 'chunked'})`);
+    const out = String(req.__gate_out || req.url || '');
+    const upServer = String(proxyRes.headers.server || '-');
+    console.log(`[proxy] ${req.method} ${req.originalUrl} -> ${out} @ ${targetOrigin(target)} => ${status} (server=${upServer}, ${ctype || '-'}, len=${proxyRes.headers['content-length'] ?? 'chunked'})`);
+    // 让浏览器 DevTools 里也能一眼看出「请求到底被转发成了什么路径」
+    res.setHeader('X-Gate-Outgoing', out);
+    res.setHeader('X-Gate-Upstream', String(status));
   }
   // 204/304 及 1xx 无响应体，不能改写、也不能注入
   const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
@@ -275,6 +390,18 @@ function handleProxyRes(proxyRes, req, res, target) {
   if (noBody || req.method === 'HEAD') {
     res.writeHead(status, headers);
     return proxyRes.pipe(res);
+  }
+
+  // 通用子路径兜底：静态资源被「上游」判 4xx 时，探测目标真实前缀并即时回源。
+  // 注意：这里针对的是上游 404（响应里带 Server / X-Arch 等目标自己的头），
+  // 不是网关的 38 字节未登录 404，也不是 CDN 缓存的 145 字节 404。
+  if (AUTO_SUBPATH && !target.base && !target.assetPrefix && !req.__gate_retried &&
+      (target.probeCount || 0) < 3 &&
+      status >= 400 && status < 500 &&
+      PROBE_ASSET_RE.test(String(req.originalUrl || ''))) {
+    req.__gate_retried = true;
+    target.probeCount = (target.probeCount || 0) + 1;
+    return handleStaticFallback(proxyRes, req, res, target, headers, status);
   }
 
   const isHtml = /text\/html/i.test(ctype);
@@ -338,14 +465,162 @@ function handleProxyRes(proxyRes, req, res, target) {
   proxyRes.pipe(res);
 }
 
+/* ------------------------------------------------------------------ *
+ * 通用子路径：静态资源 404 自动探测
+ * ------------------------------------------------------------------ */
+function bufferToRes(statusCode, headers, buf) {
+  const s = new Readable({
+    read() { this.push(buf); this.push(null); },
+  });
+  s.statusCode = statusCode;
+  s.headers = headers;
+  return s;
+}
+
+// 直接用 node:http(s) 发一次「干净」的 GET 去目标探测路径。
+// 不经过网关那套请求头加工，因此也能绕开设备对 Origin / Sec-Fetch 的校验。
+function rawFetch(target, path, req) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const mod = target.protocol === 'https' ? https : http;
+    const opts = {
+      host: target.host,
+      port: target.port,
+      path,
+      method: 'GET',
+      rejectUnauthorized: false,
+      headers: {
+        host: `${target.host}${target.port ? ':' + target.port : ''}`,
+        'accept-encoding': 'identity',
+        accept: (req && req.headers && req.headers.accept) || '*/*',
+        'user-agent': (req && req.headers && req.headers['user-agent']) || 'simpleproxy-probe',
+      },
+    };
+    const r = mod.request(opts, (up) => {
+      const chunks = [];
+      up.on('data', (c) => chunks.push(c));
+      up.on('end', () => {
+        const body = Buffer.concat(chunks);
+        done({
+          statusCode: up.statusCode || 200,
+          headers: up.headers,
+          body,
+          path,
+          stream: bufferToRes(up.statusCode || 200, up.headers, body),
+        });
+      });
+      up.on('error', () => done(null));
+    });
+    r.setTimeout(PROBE_TIMEOUT_MS, () => { r.destroy(); done(null); });
+    r.on('error', () => done(null));
+    r.end();
+  });
+}
+
+// 从目标根页面推断它真实挂在哪个前缀下（跳转 Location / <base> / 资源 src）
+async function rootPrefixes(target) {
+  const r = await rawFetch(target, '/', null);
+  if (!r) return [];
+  const out = [];
+  const skip = /^(?:login|index\.html?|default\.html?|home|api|favicon\.ico)$/i;
+  const add = (seg) => {
+    if (!seg || skip.test(String(seg))) return;
+    const p = '/' + String(seg).replace(/^\/+|\/+$/g, '');
+    if (p !== '/' && !out.includes(p)) out.push(p);
+  };
+  const loc = r.headers['location'];
+  if (loc) {
+    try { add(new URL(loc, targetOrigin(target)).pathname.split('/').filter(Boolean)[0]); } catch {}
+  }
+  const text = r.body.toString('utf8');
+  const bm = /<base[^>]+href\s*=\s*["']\/?([^"'\/?#]+)\//i.exec(text);
+  if (bm) add(bm[1]);
+  const re = /(?:src|href)\s*=\s*["']\/?([^"'\/?#]+)\//gi;
+  let m;
+  while ((m = re.exec(text)) && out.length < 8) add(m[1]);
+  return out;
+}
+
+async function buildPrefixCandidates(target, req, path) {
+  const out = [];
+  const skip = /^(?:login|index\.html?|default\.html?|home|api|favicon\.ico)$/i;
+  const add = (seg) => {
+    if (!seg || skip.test(String(seg))) return;
+    const p = '/' + String(seg).replace(/^\/+|\/+$/g, '');
+    if (p === '/' || path.startsWith(p + '/') || out.includes(p)) return;
+    out.push(p);
+  };
+  // ① 当前页面所在子路径（Referer=/wangzhang/login -> /wangzhang）
+  try {
+    const ref = new URL(String(req.headers.referer || ''));
+    add(ref.pathname.split('/').filter(Boolean)[0]);
+  } catch {}
+  // ② 目标根页面自己暴露的前缀
+  for (const p of await rootPrefixes(target)) add(p);
+  // ③ 常见部署前缀
+  DEFAULT_PREFIXES.forEach(add);
+  return out.slice(0, 8);
+}
+
+async function probeSubPath(target, req) {
+  const { path, query } = splitUrl(req.originalUrl || '/');
+  const kept = query.replace(/^\?/, '').split('&').filter(p => p && !p.startsWith(BUST_PARAM + '='));
+  const suffix = kept.length ? '?' + kept.join('&') : '';
+  const candidates = await buildPrefixCandidates(target, req, path);
+  if (!candidates.length) return null;
+  const results = await Promise.all(candidates.map(async (prefix) => {
+    const p = joinBase(prefix, path) + suffix;
+    const r = await rawFetch(target, p, req);
+    if (!r || r.statusCode < 200 || r.statusCode >= 300) return null;
+    // SPA 的 catch-all 常对任意路径回 200 + text/html，那种不是真资源
+    if (/text\/html/i.test(String(r.headers['content-type'] || ''))) return null;
+    r.prefix = prefix;
+    return r;
+  }));
+  return results.find(Boolean) || null;
+}
+
+async function handleStaticFallback(proxyRes, req, res, target, headers, status) {
+  const chunks = [];
+  proxyRes.on('data', (c) => chunks.push(c));
+  const collected = new Promise((resolve) => {
+    proxyRes.on('end', resolve);
+    proxyRes.on('error', resolve);
+  });
+
+  let hit = null;
+  try { hit = await probeSubPath(target, req); }
+  catch (e) { if (PROXY_LOG) console.log('[proxy] subpath probe error:', e.message); }
+  await collected;
+
+  if (hit) {
+    // 只记住「静态资源」前缀，不影响 /login、/api/... 等页面与接口路径
+    target.assetPrefix = hit.prefix;
+    req.__gate_out = hit.path;
+    if (PROXY_LOG) console.log(`[proxy] subpath discovered ${hit.prefix}: ${req.originalUrl} -> ${hit.path}`);
+    return handleProxyRes(hit.stream, req, res, target);
+  }
+
+  const buf = Buffer.concat(chunks);
+  delete headers['content-length'];
+  headers['content-length'] = buf.length;
+  res.writeHead(status, headers);
+  res.end(buf);
+}
+
 function rewriteLocation(loc, target) {
   try {
-    const origin = targetOrigin(target);
     if (/^https?:\/\//i.test(loc)) {
       const u = new URL(loc);
       const sameHost = u.hostname === target.host && (u.port ? parseInt(u.port, 10) : u.protocol === 'https:' ? 443 : 80) === target.port;
-      if (sameHost) return u.pathname + u.search + u.hash;
+      if (sameHost) return stripBase(u.pathname, target.base) + u.search + u.hash;
       return loc; // 指向别处则不动
+    }
+    // 目标站内的根相对跳转：把 base 去掉，浏览器才不会把前缀越叠越长
+    if (/^\//.test(loc)) {
+      const { path, query } = splitUrl(loc);
+      return stripBase(path, target.base) + query;
     }
     return loc;
   } catch {
@@ -363,6 +638,7 @@ function cookiePrefix(t) {
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
   stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
+  req.__gate_out = mapOutgoingUrl(req, target);   // 通用子路径：补上 base / 探测到的前缀
   prepareProxyReqHook(req, target);
   proxy.web(req, res, {
     target: targetOrigin(target),
@@ -399,6 +675,7 @@ function handleUpgrade(req, socket, head) {
   const s = getSession(req);
   if (!s || !s.target) return socket.destroy();
   stripBustParam(req);
+  req.__gate_out = mapOutgoingUrl(req, s.target);
   req.__gate_target = s.target;
   proxy.ws(req, socket, head, {
     target: targetOrigin(s.target),
@@ -443,7 +720,7 @@ app.get(BASE + '/api/me', (req, res) => {
     ok: true,
     authed: !!(s && s.authed),
     hasTarget: !!(s && s.target),
-    target: s && s.target ? { protocol: s.target.protocol, host: s.target.host, port: s.target.port } : null,
+    target: s && s.target ? { protocol: s.target.protocol, host: s.target.host, port: s.target.port, base: s.target.base } : null,
   });
 });
 
@@ -460,14 +737,14 @@ app.post(BASE + '/api/login', (req, res) => {
 
   const now = Date.now();
   if (req.body && req.body.save) {
-    const name = String(req.body.name || '').trim() || `${target.host}:${target.port}`;
+    const name = String(req.body.name || '').trim() || `${target.host}:${target.port}${target.base}`;
     const note = String(req.body.note || '').trim();
-    stmt.upsert.run(name, note, target.protocol, target.host, target.port, now, now);
+    stmt.upsert.run(name, note, target.protocol, target.host, target.port, target.base, now, now);
   } else {
-    const found = stmt.find.get(target.protocol, target.host, target.port);
+    const found = stmt.find.get(target.protocol, target.host, target.port, target.base);
     if (found) stmt.touch.run(now, found.id);
   }
-  res.json({ ok: true, target: { protocol: target.protocol, host: target.host, port: target.port } });
+  res.json({ ok: true, target: { protocol: target.protocol, host: target.host, port: target.port, base: target.base } });
 });
 
 /* --- 退出当前代理（回登录页） --- */
@@ -509,7 +786,16 @@ app.patch(BASE + '/api/sites/:id', (req, res) => {
   if (!row) return res.status(404).json({ ok: false, error: '记录不存在' });
   const name = req.body && req.body.name !== undefined ? String(req.body.name).trim() : row.name;
   const note = req.body && req.body.note !== undefined ? String(req.body.note).trim() : row.note;
-  stmt.update.run(name || row.name, note, id);
+  let base = req.body && req.body.base !== undefined ? String(req.body.base).trim() : (row.base || '');
+  if (base && !base.startsWith('/')) base = '/' + base;
+  if (base && !base.endsWith('/')) base += '/';
+  if (base === '/') base = '';
+  if (base && !/^\/[A-Za-z0-9._~\-%/]*$/.test(base)) return res.status(400).json({ ok: false, error: '子路径格式不正确' });
+  try {
+    stmt.update.run(name || row.name, note, base, id);
+  } catch {
+    return res.status(409).json({ ok: false, error: '已存在相同地址与子路径的保存项' });
+  }
   res.json({ ok: true });
 });
 
@@ -561,7 +847,7 @@ function stripBustParam(req) {
  * ------------------------------------------------------------------ */
 function injectExitButton(html, target) {
   if (html.includes('id="__gate_exit__"')) return html;
-  const label = target.host + (target.port ? ':' + target.port : '');
+  const label = target.host + (target.port ? ':' + target.port : '') + (target.base || target.assetPrefix || '');
   const script =
     '<div id="__gate_exit__" style="position:fixed;right:18px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;">' +
     '<button id="__gate_exit_btn__" style="display:flex;align-items:center;gap:8px;padding:9px 14px;border:0;border-radius:999px;background:#111827;color:#fff;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:.9;">' +

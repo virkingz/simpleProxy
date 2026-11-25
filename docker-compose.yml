@@ -24,8 +24,11 @@ services:
       DATA_DIR: "/data"
       # 是否在被代理页面右下角注入悬浮「退出」按钮
       INJECT_EXIT_BUTTON: "true"
-      # 排查用：设为 "true" 会打印每个代理请求的上游状态码（docker logs -f simpleproxy）
+      # 排查用：打印「实际转发路径 + 上游状态码」，并给响应加 X-Gate-* 诊断头
       PROXY_LOG: "${PROXY_LOG:-false}"
+      # 通用子路径：静态资源在根路径被上游判 404 时自动探测真实前缀
+      AUTO_SUBPATH: "${AUTO_SUBPATH:-true}"
+      PROBE_TIMEOUT_MS: "${PROBE_TIMEOUT_MS:-1200}"
       # 目标做防盗链/Host 校验而返回 403 时保持默认；设为 "false" 可 A/B 对比
       STRIP_CLIENT_HEADERS: "${STRIP_CLIENT_HEADERS:-true}"
       # 前面套 CDN 时必须保持默认值（禁止共享缓存），否则 404 会被 CDN 缓存固化

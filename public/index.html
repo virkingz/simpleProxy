@@ -116,14 +116,14 @@
           <div class="logo">G</div>
           <div>
             <h1>登录内网服务</h1>
-            <p>输入 内网 IP : 端口，登录后所有请求将代理到该地址</p>
+            <p>输入 内网 IP : 端口（可带子路径），登录后所有请求代理到该地址</p>
           </div>
         </div>
         <div class="err" id="e-login"></div>
         <div class="field">
           <label>目标地址</label>
-          <input type="text" id="target" placeholder="192.168.1.10:8080" autocomplete="off" spellcheck="false">
-          <div class="hint">支持 http / https / WebSocket。省略协议默认 http，例如 <code>10.0.0.5:9000</code>；自签 https 证书将自动忽略校验。</div>
+          <input type="text" id="target" placeholder="192.168.1.10:8080 或 10.0.0.5:9000/wangzhang/" autocomplete="off" spellcheck="false">
+          <div class="hint">支持 http / https / WebSocket，省略协议默认 http；自签 https 证书自动忽略校验。<br>服务挂在子路径时把路径一起填上，例如 <code>10.0.0.5:9000/wangzhang/</code>；静态资源若在别的目录，网关会自动探测。</div>
         </div>
         <label class="row" style="margin-bottom:12px">
           <input type="checkbox" id="save">
@@ -231,7 +231,7 @@ $('target').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-log
 function fmt(s){
   const def = (s.protocol === 'http' && s.port === 80) || (s.protocol === 'https' && s.port === 443);
   const hp = def ? s.host : s.host + ':' + s.port;
-  return (s.protocol === 'https' ? 'https://' : 'http://') + hp;
+  return (s.protocol === 'https' ? 'https://' : 'http://') + hp + (s.base || '');
 }
 function esc(v){ return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -281,6 +281,7 @@ function openEdit(node, site){
     <div class="nt-edit">
       <input type="text" class="e-name" value="${esc(site.name)}" placeholder="名称" maxlength="80">
       <input type="text" class="e-note" value="${esc(site.note || '')}" placeholder="备注（可选）" maxlength="200">
+      <input type="text" class="e-base" value="${esc(site.base || '')}" placeholder="子路径（可选），例如 /wangzhang/" maxlength="120">
       <div class="acts">
         <button class="cancel" type="button">取消</button>
         <button class="ok" type="button">保存</button>
@@ -288,20 +289,22 @@ function openEdit(node, site){
     </div>`;
   const nameIn = meta.querySelector('.e-name');
   const noteIn = meta.querySelector('.e-note');
+  const baseIn = meta.querySelector('.e-base');
   nameIn.focus();
   nameIn.setSelectionRange(nameIn.value.length, nameIn.value.length);
+  const vals = () => [nameIn.value.trim(), noteIn.value.trim(), baseIn.value.trim()];
   const close = () => { meta.innerHTML = old; loadSites(); };
   meta.querySelector('.cancel').onclick = (e) => { e.stopPropagation(); close(); };
-  meta.querySelector('.ok').onclick = (e) => { e.stopPropagation(); saveEdit(site.id, nameIn.value.trim(), noteIn.value.trim()); };
-  [nameIn, noteIn].forEach(inp => inp.addEventListener('click', e => e.stopPropagation()));
+  meta.querySelector('.ok').onclick = (e) => { e.stopPropagation(); saveEdit(site.id, ...vals()); };
+  [nameIn, noteIn, baseIn].forEach(inp => inp.addEventListener('click', e => e.stopPropagation()));
   meta.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); saveEdit(site.id, nameIn.value.trim(), noteIn.value.trim()); }
+    if (e.key === 'Enter') { e.preventDefault(); saveEdit(site.id, ...vals()); }
     if (e.key === 'Escape') { e.preventDefault(); close(); }
   });
 }
 
-async function saveEdit(id, name, note){
-  const { status, data } = await api('/sites/' + id, { method: 'PATCH', body: { name, note } });
+async function saveEdit(id, name, note, base){
+  const { status, data } = await api('/sites/' + id, { method: 'PATCH', body: { name, note, base } });
   if (status === 200) loadSites();
   else alert(data.error || '保存失败');
 }
