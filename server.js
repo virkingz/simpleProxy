@@ -1072,6 +1072,16 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   proxyRes.pipe(res);
 });
 
+// 有些站点把 CSP 写在 <meta http-equiv="Content-Security-Policy"> 里，
+// 只删响应头不够；若其中未放行 inline script，注入的按钮会被浏览器拦掉。
+// 这里移除该 meta 的「脚本相关限制」，其余指令（如 img-src）原样保留。
+function stripMetaCsp(html) {
+  return String(html).replace(
+    /<meta[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi,
+    ''
+  );
+}
+
 // 透明模式专用：只注入退出按钮，绝不改写其它内容
 function injectOnlyHtml(proxyRes, req, res, target) {
   const headers = { ...proxyRes.headers };
@@ -1080,6 +1090,11 @@ function injectOnlyHtml(proxyRes, req, res, target) {
   // 若保留上游的 transfer-encoding: chunked，会出现
   // 「Content-Length can't be present with Transfer-Encoding」协议错误。
   delete headers['transfer-encoding'];
+  // 退出按钮是一段内联脚本；若目标下发了 CSP 且未允许 inline script，
+  // 浏览器会直接拦掉它（按钮就不出现）。这里移除 CSP，保证按钮能执行。
+  delete headers['content-security-policy'];
+  delete headers['content-security-policy-report-only'];
+  if (headers['x-frame-options']) delete headers['x-frame-options'];
   const chunks = [];
   proxyRes.on('data', (c) => chunks.push(c));
   proxyRes.on('end', () => {
@@ -1094,7 +1109,7 @@ function injectOnlyHtml(proxyRes, req, res, target) {
       res.end(buf);
       return;
     }
-    const out = Buffer.from(injectExitButton(body, target, { mode: 'transparent' }), 'utf8');
+    const out = Buffer.from(injectExitButton(stripMetaCsp(body), target, { mode: 'transparent' }), 'utf8');
     delete headers['content-encoding'];
     delete headers['content-length'];
     headers['content-length'] = out.length;
@@ -1467,19 +1482,41 @@ function stripBustParam(req) {
  * 页面
  * ------------------------------------------------------------------ */
 function injectExitButton(html, target, opts = {}) {
-  if (html.includes('id="__gate_exit__"')) return html;
+  if (html.includes('__gate_exit__')) return html;
   const label = target.host + (target.port ? ':' + target.port : '') + (target.base || target.assetPrefix || '');
   const modeTag = opts.mode === 'transparent' ? '透明代理' : '代理中';
+  // 说明：不少 SPA（Vite/React/Vue）挂载时会整体替换 <body> 内容，
+  // 直接把按钮写进 body 会被「洗掉」。因此这里只注入一段自愈脚本：
+  //   · 节点挂到 <html>(documentElement) 上，body 被重建也不受影响；
+  //   · 用 MutationObserver 监听，一旦被移除就重新挂上；
+  //   · 不依赖任何外部资源，纯内联，零改写原有内容。
+  const j = (s) => JSON.stringify(String(s));   // 安全嵌入字符串
   const script =
-    '<div id="__gate_exit__" style="position:fixed;right:18px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;">' +
-    '<button id="__gate_exit_btn__" style="display:flex;align-items:center;gap:8px;padding:9px 14px;border:0;border-radius:999px;background:#111827;color:#fff;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:.9;">' +
-    '<span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block;"></span>' +
-    '<span>' + modeTag + ' ' + label + '</span>' +
-    '<span style="opacity:.5">|</span>' +
-    '<span style="text-decoration:underline">退出</span>' +
-    '</button></div>' +
-    '<script>(function(){var b=document.getElementById("__gate_exit_btn__");if(!b)return;b.addEventListener("click",function(){if(!confirm("退出代理并返回登录页？"))return;fetch("/_gate/api/logout",{method:"POST"}).then(function(){location.href="/"}).catch(function(){location.href="/"});});})();<' + '/script>';
+    '<script data-gate-exit="1">(function(){' +
+    'if(window.__gate_exit_installed__)return;window.__gate_exit_installed__=true;' +
+    'var LABEL=' + j(modeTag + ' ' + label) + ';' +
+    'function build(){' +
+    'var d=document.createElement("div");d.id="__gate_exit__";' +
+    'd.setAttribute("style","position:fixed;right:18px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;");' +
+    'd.innerHTML=' + j('<button id="__gate_exit_btn__" style="display:flex;align-items:center;gap:8px;padding:9px 14px;border:0;border-radius:999px;background:#111827;color:#fff;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:.92;"><span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block;"></span><span></span><span style="opacity:.5">|</span><span style="text-decoration:underline">退出</span></button>') + ';' +
+    'var b=d.querySelector("button");var t=b.querySelectorAll("span")[1];if(t)t.textContent=LABEL;' +
+    'b.addEventListener("click",function(){if(!confirm("退出代理并返回登录页？"))return;' +
+    'fetch("/_gate/api/logout",{method:"POST"}).then(function(){location.href="/"}).catch(function(){location.href="/"});});' +
+    'return d;}' +
+    'function mount(){' +
+    'if(!document.body){return setTimeout(mount,30);}' +
+    'if(document.getElementById("__gate_exit__"))return;' +
+    'var host=document.documentElement||document.body;' +
+    'host.appendChild(build());}' +
+    'function watch(){' +
+    'var obs=new MutationObserver(function(){if(!document.getElementById("__gate_exit__"))mount();});' +
+    'obs.observe(document.documentElement,{childList:true,subtree:true});' +
+    'var n=0,timer=setInterval(function(){if(!document.getElementById("__gate_exit__"))mount();if(++n>60)clearInterval(timer);},500);}' +
+    'if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",function(){mount();watch();});' +
+    'else{mount();watch();}' +
+    '})();<' + '/script>';
   if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, script + '</body>');
+  if (/<\/html>/i.test(html)) return html.replace(/<\/html>/i, script + '</html>');
   return html + script;
 }
 
