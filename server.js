@@ -628,16 +628,23 @@ function selfRequest(path, req, ae) {
   });
 }
 
-// 判断响应体是否「像被当成文本输出的二进制垃圾」（压缩字节被当 utf8 回写）
-function sniffBinary(buf) {
+// 判断响应体是否「像被当成文本输出的二进制垃圾」（压缩字节被当 utf8 回写）。
+// 只对**文本类**资源有意义：图片 / 字体 / ico 等本来就是二进制，
+// 不能用这个指标判定异常（否则 favicon 会被误报）。
+function isTextualType(ct) {
+  return /(javascript|ecmascript|text\/|application\/json|\+json|xml|svg)/i.test(String(ct || ''));
+}
+function sniffBinary(buf, contentType) {
+  const head = buf.slice(0, 120).toString('latin1');
+  if (!isTextualType(contentType)) return { binary: false, textual: false, head };
   const n = Math.min(buf.length, 256);
-  if (!n) return { binary: false, nonPrintable: 0, head: '' };
+  if (!n) return { binary: false, textual: true, head };
   let non = 0;
   for (let i = 0; i < n; i++) {
     const b = buf[i];
     if (b !== 9 && b !== 10 && b !== 13 && (b < 32 || b > 126)) non++;
   }
-  return { binary: non / n > 0.03, nonPrintable: non, head: buf.slice(0, 120).toString('latin1') };
+  return { binary: non / n > 0.03, textual: true, nonPrintable: non, head };
 }
 
 // 从目标根页面推断它真实挂在哪个前缀下（跳转 Location / <base> / 资源 src）
@@ -978,11 +985,12 @@ app.get(BASE + '/api/diag', async (req, res) => {
     const resp = await selfRequest(rp, req, 'gzip, deflate, br, zstd');
     if (!resp) { viaProxy.push({ url: rp, error: 'gateway unreachable' }); continue; }
     const enc = String(resp.headers['content-encoding'] || '').toLowerCase();
-    const sniff = sniffBinary(resp.body);
+    const ct = resp.headers['content-type'] || null;
+    const sniff = sniffBinary(resp.body, ct);
     viaProxy.push({
       url: rp,
       status: resp.statusCode,
-      contentType: resp.headers['content-type'] || null,
+      contentType: ct,
       contentEncoding: enc || null,
       bytes: resp.body.length,
       bodyLooksBinary: sniff.binary,
@@ -990,12 +998,13 @@ app.get(BASE + '/api/diag', async (req, res) => {
     });
   }
 
-  // 找「直连上游 200、但经网关仍失败或变成二进制垃圾」的项 = 代理层 bug
+  // 找「直连上游 200、但经网关仍失败或（文本资源）变成二进制垃圾」的项 = 代理层 bug
   const proxyBroken = [];
   for (const vp of viaProxy) {
     if (vp.error || !vp.url) continue;
+    if (!isTextualType(vp.contentType)) continue;   // 图片/字体等二进制资源跳过
     const direct = probes.find((p) => p.url === vp.url && okProbe(p));
-    const proxiedOk = vp.status >= 200 && vp.status < 300 && !/text\/html/i.test(String(vp.contentType || ''));
+    const proxiedOk = vp.status >= 200 && vp.status < 300;
     if (proxiedOk && !vp.bodyLooksBinary) continue;              // 代理正常
     if (direct) proxyBroken.push({ ...vp, directStatus: direct.status, directBytes: direct.bytes });
     else proxyBroken.push(vp);
