@@ -1,0 +1,13 @@
+# SimpleProxy · 本地构建版（覆盖文件）
+#
+# 不想用 CI 镜像、想基于本地源码构建时使用：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 或在 docker-compose.yml 里直接加回 build: . 亦可。
+
+services:
+  simpleproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: simpleproxy:local

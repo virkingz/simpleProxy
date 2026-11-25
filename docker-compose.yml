@@ -1,22 +1,42 @@
+# SimpleProxy · 直接使用 CI 构建好的镜像（推荐）
+#
+# 用法：
+#   1) 复制环境变量文件并修改 TOKEN：cp .env.example .env
+#   2) docker compose up -d
+#
+# 也可以不建 .env，直接把下面 TOKEN 的默认值改掉。
+
 services:
   simpleproxy:
-    build: .
-    image: simpleproxy:latest
+    # CI 自动构建并推送到 GHCR 的镜像
+    image: ghcr.io/virkingz/simpleproxy:latest
     container_name: simpleproxy
     restart: unless-stopped
+
     ports:
+      # 左边是宿主机端口（浏览器访问用），可通过 .env 的 GATE_PORT 修改
       - "${GATE_PORT:-8080}:8080"
+
     environment:
-      # ⚠ 必须修改：进入网关页所需的访问令牌
+      # ⚠ 必须修改：进入网关页面所需的访问令牌
       TOKEN: "${TOKEN:-changeme}"
       PORT: "8080"
       DATA_DIR: "/data"
-      # 是否在被代理页面注入右下角悬浮「退出」按钮
+      # 是否在被代理页面右下角注入悬浮「退出」按钮
       INJECT_EXIT_BUTTON: "true"
+
     volumes:
-      # SQLite 数据持久化（保存的地址列表）
+      # SQLite 数据持久化（保存的地址列表）。删除 ./data 会清空已保存地址
       - ./data:/data
-    # 若要代理的内网服务跑在宿主机上（如 127.0.0.1:xxxx），
-    # 取消下面注释，容器内即可用 host.docker.internal 访问宿主机
+
+    # 若目标服务跑在宿主机上（如 127.0.0.1:9000），打开下面注释，
+    # 登录时填 host.docker.internal:9000 即可访问宿主机
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"
+
+    # 自带 HEALTHCHECK（见 Dockerfile），如需覆盖可打开：
+    # healthcheck:
+    #   test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/_gate/api/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    #   interval: 30s
+    #   timeout: 4s
+    #   retries: 3

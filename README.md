@@ -25,7 +25,8 @@ simpleProxy/
 ├── public/index.html               # 前端：门禁页 + 登录页 + 右侧保存列表
 ├── package.json
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml              # Compose：默认拉取 GHCR 镜像
+├── docker-compose.build.yml        # Compose 覆盖文件：改为本地源码构建
 ├── .env.example
 ├── .github/workflows/docker.yml    # CI：构建并推送镜像到 GHCR
 └── data/                           # 运行时生成，SQLite 数据（已挂载）
@@ -33,9 +34,20 @@ simpleProxy/
 
 ## 快速开始
 
-### 方式一：拉取 CI 构建好的镜像（推荐）
+### 方式一：Docker Compose（推荐）
 
-CI 会在每次推送后自动构建镜像并推送到 GHCR：
+```bash
+cp .env.example .env
+# 编辑 .env，务必修改 TOKEN
+docker compose up -d
+```
+
+> 默认使用 CI 构建好的镜像 `ghcr.io/virkingz/simpleproxy:latest`，如需基于本地源码构建，加上覆盖文件：
+> ```bash
+> docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+> ```
+
+### 方式二：docker run 直接用镜像
 
 ```bash
 # 镜像地址（public 仓库可直接拉取）
@@ -50,14 +62,6 @@ docker run -d --name simpleproxy \
 ```
 
 > 若仓库/包为 private，需先登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u <你的用户名> --password-stdin`
-
-### 方式二：本地 Compose 构建
-
-```bash
-cp .env.example .env
-# 编辑 .env，务必修改 TOKEN
-docker compose up -d --build
-```
 
 ### 方式三：手动构建
 
