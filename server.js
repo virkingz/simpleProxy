@@ -57,6 +57,50 @@ const BUST_CDN_CACHE = process.env.BUST_CDN_CACHE !== 'false';
 const BUST_PARAM = '_gw';
 
 /* ------------------------------------------------------------------ *
+ * 端口转发模式（PORT_FORWARD）
+ *
+ * 这是与「路径代理」并存的第二种工作模式，两者取长补短：
+ *
+ *  · 路径代理（默认）：网关在同一个域名/端口下用路径区分目标，靠改写
+ *    HTML/JS 让子资源也走网关。优点是不用额外端口；缺点是要改写内容，
+ *    复杂的 SPA（动态 import、内联 worker、绝对 URL、__vite__ 预加载等）
+ *    容易出现漏改 → 页面空白。
+ *
+ *  · 端口转发：登录后网关在宿主机另开一个「专属端口」，把该端口的全部
+ *    流量**原样**转给目标（不改写任何 HTML/JS）。浏览器直接访问
+ *    http://<网关IP>:<专属端口>/，目标站点看到的自己就是「根路径」，
+ *    因此不存在绝对路径错位、也不存在改写遗漏 —— 从根上绕开整类问题。
+ *
+ * 安全：专属端口同样要求携带网关会话 Cookie，且会话必须已选择目标，
+ * 否则返回一个提示页，避免变成开放代理。
+ * ------------------------------------------------------------------ */
+const PORT_FORWARD = process.env.PORT_FORWARD !== 'false';   // 是否允许端口转发模式
+const PF_RANGE_START = Math.max(1, parseInt(process.env.PORT_FORWARD_START || '20000', 10) || 20000);
+const PF_RANGE_END = Math.min(65535, parseInt(process.env.PORT_FORWARD_END || '20999', 10) || 20999);
+const PF_HOST = process.env.PORT_FORWARD_HOST || '';        // 展示用的网关可达地址（可选）
+
+/* ------------------------------------------------------------------ *
+ * 透明代理模式（TRANSPARENT，nginx 风格）—— 推荐默认
+ *
+ * 与「路径代理 + 内容改写」的根本区别：**完全不碰响应体**。
+ * 不注入退出按钮、不重写 origin、不加 _gw、不去 base。只做三件事：
+ *   · 把请求原样转给目标（换 Host）；
+ *   · 把上游 Set-Cookie 原样回传（不再改名/去 Domain/改 Path）；
+ *   · 透传状态码与响应头。
+ *
+ * 为什么这样更不容易白屏：改写 HTML/JS 是「侵入式」的，现代前端
+ * （Vite 的动态 import、__vite__mapDeps、内联 worker、根绝对路径资源）
+ * 一旦被改错一处就会整页崩。透明转发让目标服务始终认为自己在根路径，
+ * 前端拿到的是**一字未改**的原始代码，因此不存在「漏改」。
+ *
+ * HTTPS 说明：网关对外是什么协议就是什么协议，转发时与目标之间按目标
+ * 自身的 scheme 建立连接（网关 → 目标 走 http 或 https 均可，可跨协议），
+ * 因此不存在「http 页面请求 https 资源」的混合内容问题；目标若用自签
+ * 证书，已内置 secure:false 忽略校验。
+ * ------------------------------------------------------------------ */
+const TRANSPARENT = process.env.TRANSPARENT !== 'false';   // 是否提供透明模式
+
+/* ------------------------------------------------------------------ *
  * 通用子路径（base path）代理
  *
  * 很多内网服务不是挂在 / 根，而是挂在 /wangzhang/、/web/、/ui/ 这类
@@ -165,7 +209,7 @@ function getSession(req, res, create = false) {
   let s = sid && sessions.get(sid);
   if (!s && create) {
     sid = crypto.randomUUID().replace(/-/g, '');
-    s = { authed: false, target: null, createdAt: Date.now(), lastSeen: Date.now() };
+    s = { sid, authed: false, target: null, createdAt: Date.now(), lastSeen: Date.now() };
     sessions.set(sid, s);
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200`);
   }
@@ -173,10 +217,19 @@ function getSession(req, res, create = false) {
   return s || null;
 }
 
+// 只读 sid（供端口转发监听器使用，不创建会话）
+function readSid(req) {
+  const m = /(?:^|;\s*)_gate_sid=([^;]+)/.exec(String(req.headers.cookie || ''));
+  return m ? m[1] : null;
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [sid, s] of sessions) {
-    if (now - s.lastSeen > SESSION_TTL_MS) sessions.delete(sid);
+    if (now - s.lastSeen > SESSION_TTL_MS) {
+      if (typeof pfRelease === 'function') pfRelease(s);
+      sessions.delete(sid);
+    }
   }
 }, 60 * 1000).unref();
 
@@ -219,6 +272,7 @@ function normalizeTarget(input) {
   const protocol = u.protocol.replace(':', '');
   return {
     protocol, host, port, base,
+    mode: 'path',                    // 运行时由登录参数决定：path | transparent
     assetPrefix: '',                 // 自动探测到的静态资源前缀（仅会话内有效）
     key: `${protocol}//${host}:${port}${base}`,
   };
@@ -776,6 +830,25 @@ function cookiePrefix(t) {
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
   stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
+  // 透明模式：不补 base、不改写、不注入，完全原样转发
+  if (target.mode === 'transparent') {
+    req.__gate_transparent = true;
+    prepareProxyReqHook(req, target);
+    proxy.web(req, res, {
+      target: targetOrigin(target),
+      changeOrigin: true,
+      secure: false,
+      selfHandleResponse: true,
+      xfwd: false,
+      headers: { host: `${target.host}${target.port ? ':' + target.port : ''}` },
+    }, (err) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(errorPage(err.message));
+      }
+    });
+    return;
+  }
   req.__gate_out = mapOutgoingUrl(req, target);   // 通用子路径：补上 base / 探测到的前缀
   prepareProxyReqHook(req, target);
   proxy.web(req, res, {
@@ -803,6 +876,7 @@ proxy.on('proxyReqWs', (proxyReq, req) => {
   if (req.__gate_target) prepareProxyReq(proxyReq, req, req.__gate_target);
 });
 proxy.on('proxyRes', (proxyRes, req, res) => {
+  if (req.__pf_port || req.__gate_transparent) return;   // 直通类：交给下方处理器
   handleProxyRes(proxyRes, req, res, req.__gate_target);
 });
 
@@ -813,7 +887,8 @@ function handleUpgrade(req, socket, head) {
   const s = getSession(req);
   if (!s || !s.target) return socket.destroy();
   stripBustParam(req);
-  req.__gate_out = mapOutgoingUrl(req, s.target);
+  // 透明模式：路径不补前缀，原样转发
+  if (s.target.mode !== 'transparent') req.__gate_out = mapOutgoingUrl(req, s.target);
   req.__gate_target = s.target;
   proxy.ws(req, socket, head, {
     target: targetOrigin(s.target),
@@ -821,6 +896,192 @@ function handleUpgrade(req, socket, head) {
     secure: false,
     headers: { host: `${s.target.host}${s.target.port ? ':' + s.target.port : ''}` },
   });
+}
+
+/* ------------------------------------------------------------------ *
+ * 端口转发引擎
+ *
+ * 为每个「已登录且选择了目标」的会话分配一个宿主机端口，该端口上收到的
+ * 所有 HTTP/WebSocket 流量**原样**转发给目标，不做任何 HTML/JS 改写。
+ * 这样目标服务始终认为自己在根路径，绝对 URL、动态 import、worker、
+ * __vite__ 预加载等全部天然正确 —— 彻底绕开「改写漏改」这类问题。
+ *
+ * 端口按需分配（懒创建），会话退出或超时后回收。
+ * ------------------------------------------------------------------ */
+const pfServers = new Map();   // port -> { server, sid, target }
+
+function pfGetInfo() {
+  // 返回可对外展示的宿主机地址（尽力而为，失败则回退问号）
+  return PF_HOST;
+}
+
+// 为一个会话启动端口转发监听（幂等）
+async function pfEnsure(session) {
+  if (!PORT_FORWARD || !session || !session.target) return null;
+  // 已分配且目标未变：直接复用
+  if (session.pfPort && pfServers.has(session.pfPort)) {
+    const cur = pfServers.get(session.pfPort);
+    if (cur.target && cur.target.key === session.target.key) return session.pfPort;
+    pfRelease(session);
+  }
+  const taken = new Set(pfServers.keys());
+  for (let p = PF_RANGE_START; p <= PF_RANGE_END; p++) {
+    if (taken.has(p) || p === PORT) continue;
+    const ok = await pfBind(p, session);
+    if (ok) return p;
+  }
+  return null;
+}
+
+// 尝试在 port 上监听；成功返回 true，端口被占用返回 false
+function pfBind(port, session) {
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => pfHandleHttp(req, res, port));
+    srv.on('upgrade', (req, socket, head) => pfHandleUpgrade(req, socket, head, port));
+    srv.on('clientError', (err, socket) => { try { socket.destroy(); } catch {} });
+
+    const onError = () => {
+      srv.removeListener('listening', onListening);
+      try { srv.close(); } catch {}
+      resolve(false);
+    };
+    const onListening = () => {
+      srv.removeListener('error', onError);
+      const rec = { server: srv, sid: session.sid, target: session.target, key: session.target.key };
+      pfServers.set(port, rec);
+      session.pfPort = port;
+      if (PROXY_LOG) console.log(`[portfwd] session ${String(session.sid).slice(0, 8)} -> :${port} => ${targetOrigin(session.target)}`);
+      resolve(true);
+    };
+    srv.once('error', onError);
+    srv.once('listening', onListening);
+    try { srv.listen(port, '0.0.0.0'); } catch { onError(); }
+  });
+}
+
+function pfRelease(session) {
+  if (!session || !session.pfPort) return;
+  const rec = pfServers.get(session.pfPort);
+  if (rec && rec.sid === session.sid) {
+    pfServers.delete(session.pfPort);
+    try { rec.server.close(); } catch {}
+    if (PROXY_LOG) console.log(`[portfwd] released :${session.pfPort}`);
+  }
+  session.pfPort = null;
+}
+
+// 端口上的会话解析：必须带合法 sid 且已选定目标
+function pfResolve(req) {
+  const sid = readSid(req);
+  const s = sid && sessions.get(sid);
+  if (s) s.lastSeen = Date.now();
+  return s;
+}
+
+function pfDeny(res, reason) {
+  res.writeHead(403, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(`<!doctype html><html lang="zh"><meta charset="utf-8"><title>需要登录</title>
+<body style="font-family:system-ui;padding:40px;line-height:1.7;color:#0f172a;background:#f8fafc">
+<h2 style="margin:0 0 10px">未授权访问该转发端口</h2>
+<p style="color:#475569">${reason}</p>
+<p>请先在网关登录页完成 Token 校验并选择目标服务，再从本端口访问。</p>
+</body></html>`);
+}
+
+function pfHandleHttp(req, res, port) {
+  const s = pfResolve(req);
+  if (!s) return pfDeny(res, '没有有效的网关会话（Cookie 缺失或已过期）。');
+  if (!s.target) return pfDeny(res, '当前会话还没有选择目标服务。');
+  const rec = pfServers.get(port);
+  if (rec) rec.target = s.target;         // 目标切换后即时生效
+
+  // 原样转发：不改写、不注入、不剥离任何东西
+  req.url = req.url || '/';
+  req.__pf_port = port;                   // 标记：响应侧直通，不做任何改写
+  const t = s.target;
+  proxy.web(req, res, {
+    target: targetOrigin(t),
+    changeOrigin: true,
+    secure: false,
+    selfHandleResponse: true,
+    xfwd: false,
+    headers: { host: `${t.host}${t.port ? ':' + t.port : ''}` },
+  });
+}
+
+function pfHandleUpgrade(req, socket, head, port) {
+  const s = pfResolve(req);
+  if (!s || !s.target) { try { socket.destroy(); } catch {} return; }
+  const t = s.target;
+  proxy.ws(req, socket, head, {
+    target: targetOrigin(t),
+    changeOrigin: true,
+    secure: false,
+    headers: { host: `${t.host}${t.port ? ':' + t.port : ''}` },
+  });
+}
+
+// 端口转发下的响应：直通，不做 Cookie 改名 / Location 重写 / HTML 注入
+/* ---- 直通（端口转发 / 透明代理）：原样回传，不做任何改写 ----
+ * 这里是「零改写」的关键：状态码、全部响应头、Set-Cookie、Location、
+ * Content-Encoding、分块传输…… 一律原封不动交给浏览器。
+ * 唯一例外：透明模式下为了能「退出」，会在 HTML 的 </body> 前追加一个
+ * 悬浮按钮（只追加、不改写任何既有内容），可通过 INJECT_EXIT_BUTTON=false 关闭。*/
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  if (!req.__pf_port && !req.__gate_transparent) return;  // 普通路径代理交给原逻辑
+  const tag = req.__pf_port ? 'portfwd' : 'transparent';
+  if (PROXY_LOG) {
+    console.log(`[${tag}] ${req.method} ${req.originalUrl} => ${proxyRes.statusCode} (${proxyRes.headers['content-type'] || '-'})`);
+  }
+  // 透明模式 + 注入开关：仅对 HTML 追加一个退出按钮，其余响应全部原样
+  if (req.__gate_transparent && INJECT_EXIT && !req.__pf_port) {
+    const ctype = String(proxyRes.headers['content-type'] || '');
+    const status = proxyRes.statusCode || 200;
+    const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
+    if (!noBody && req.method !== 'HEAD' && /text\/html/i.test(ctype)) {
+      return injectOnlyHtml(proxyRes, req, res, req.__gate_target);
+    }
+  }
+  // 防共享缓存：代理响应若被 CDN 按 URL 缓存，会导致切换目标串味 / 旧响应固化。
+  // 只覆盖缓存头，其它头（Set-Cookie / Location / Content-Encoding）保持原样。
+  const headers = { ...proxyRes.headers };
+  delete headers['cache-control'];
+  delete headers['expires'];
+  delete headers['pragma'];
+  delete headers['age'];
+  headers['cache-control'] = CACHE_CONTROL;
+  const vary = String(headers['vary'] || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!vary.some((v) => v.toLowerCase() === 'cookie')) vary.push('Cookie');
+  headers['vary'] = vary.join(', ');
+  res.writeHead(proxyRes.statusCode || 200, headers);
+  proxyRes.pipe(res);
+});
+
+// 透明模式专用：只注入退出按钮，绝不改写其它内容
+function injectOnlyHtml(proxyRes, req, res, target) {
+  const headers = { ...proxyRes.headers };
+  const enc = String(headers['content-encoding'] || '').toLowerCase();
+  const chunks = [];
+  proxyRes.on('data', (c) => chunks.push(c));
+  proxyRes.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    const decode = makeDecoder(enc);
+    let body = null;
+    if (decode) { try { body = decode(buf).toString('utf8'); } catch { body = null; } }
+    // 解不开（未知编码）→ 原样透传，宁可不注入也不破坏
+    if (body === null) {
+      res.writeHead(proxyRes.statusCode || 200, headers);
+      res.end(buf);
+      return;
+    }
+    const out = Buffer.from(injectExitButton(body, target, { mode: 'transparent' }), 'utf8');
+    delete headers['content-encoding'];
+    delete headers['content-length'];
+    headers['content-length'] = out.length;
+    res.writeHead(proxyRes.statusCode || 200, headers);
+    res.end(out);
+  });
+  proxyRes.on('error', () => { try { res.end(); } catch {} });
 }
 
 /* ------------------------------------------------------------------ *
@@ -857,19 +1118,28 @@ app.get(BASE + '/api/me', (req, res) => {
   res.json({
     ok: true,
     build: BUILD_ID,
+    portForward: PORT_FORWARD,
+    transparent: TRANSPARENT,
+    pfHost: PF_HOST || null,
     authed: !!(s && s.authed),
     hasTarget: !!(s && s.target),
+    pfPort: (s && s.pfPort) || null,
+    mode: (s && s.target && s.target.mode) || null,
     target: s && s.target ? { protocol: s.target.protocol, host: s.target.host, port: s.target.port, base: s.target.base } : null,
   });
 });
 
 /* --- 登录目标 --- */
-app.post(BASE + '/api/login', (req, res) => {
+app.post(BASE + '/api/login', async (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
 
   const target = normalizeTarget((req.body && req.body.target) || '');
   if (!target) return res.status(400).json({ ok: false, error: '地址格式不正确，示例：192.168.1.10:8080' });
+
+  // 代理模式：transparent（nginx 风格、零改写，推荐）/ path（路径代理 + 改写）
+  const reqMode = String((req.body && req.body.mode) || 'path');
+  target.mode = reqMode === 'transparent' && TRANSPARENT ? 'transparent' : 'path';
 
   s.target = target;
   s.lastSeen = Date.now();
@@ -883,13 +1153,29 @@ app.post(BASE + '/api/login', (req, res) => {
     const found = stmt.find.get(target.protocol, target.host, target.port, target.base);
     if (found) stmt.touch.run(now, found.id);
   }
-  res.json({ ok: true, target: { protocol: target.protocol, host: target.host, port: target.port, base: target.base } });
+
+  // 端口转发模式：为会话分配专属端口（可失败，失败则回退路径代理）
+  let pfPort = null;
+  if (PORT_FORWARD && req.body && req.body.mode === 'port') {
+    try { pfPort = await pfEnsure(s); } catch (e) { if (PROXY_LOG) console.log('[portfwd] alloc failed:', e.message); }
+    if (!pfPort) target.mode = 'path';   // 分配失败则回退
+  } else {
+    pfRelease(s);
+  }
+
+  res.json({
+    ok: true,
+    target: { protocol: target.protocol, host: target.host, port: target.port, base: target.base },
+    mode: pfPort ? 'port' : target.mode,   // port | transparent | path
+    pfPort,
+    pfHost: pfPort ? PF_HOST : null,
+  });
 });
 
 /* --- 退出当前代理（回登录页） --- */
 app.post(BASE + '/api/logout', (req, res) => {
   const s = getSession(req);
-  if (s) s.target = null;
+  if (s) { pfRelease(s); s.target = null; }
   res.json({ ok: true });
 });
 
@@ -897,6 +1183,8 @@ app.post(BASE + '/api/logout', (req, res) => {
 app.post(BASE + '/api/exit', (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
   const sid = cookies[COOKIE_NAME];
+  const s = sid && sessions.get(sid);
+  if (s) pfRelease(s);
   if (sid) sessions.delete(sid);
   res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
   res.json({ ok: true });
@@ -1158,14 +1446,15 @@ function stripBustParam(req) {
 /* ------------------------------------------------------------------ *
  * 页面
  * ------------------------------------------------------------------ */
-function injectExitButton(html, target) {
+function injectExitButton(html, target, opts = {}) {
   if (html.includes('id="__gate_exit__"')) return html;
   const label = target.host + (target.port ? ':' + target.port : '') + (target.base || target.assetPrefix || '');
+  const modeTag = opts.mode === 'transparent' ? '透明代理' : '代理中';
   const script =
     '<div id="__gate_exit__" style="position:fixed;right:18px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;">' +
     '<button id="__gate_exit_btn__" style="display:flex;align-items:center;gap:8px;padding:9px 14px;border:0;border-radius:999px;background:#111827;color:#fff;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:.9;">' +
     '<span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block;"></span>' +
-    '<span>代理中 ' + label + '</span>' +
+    '<span>' + modeTag + ' ' + label + '</span>' +
     '<span style="opacity:.5">|</span>' +
     '<span style="text-decoration:underline">退出</span>' +
     '</button></div>' +
