@@ -162,8 +162,10 @@ A：**这是压缩协商问题，不是路径问题。** 这类设备（飞牛 f
 
 网关早期为了注入退出按钮，对所有请求强制 `Accept-Encoding: identity`，正好踩中这个坑。现在已改为：
 
-- 页面导航（`Accept: text/html`）：请求 `gzip, deflate, br`（Node 可解码，解压后注入退出按钮，HTML 本身压缩也不影响）；
-- 其它请求：**原样透传浏览器的 `Accept-Encoding`**，并在已知目标依赖压缩时自动兜底补 `gzip, deflate, br`。
+- 统一把 `Accept-Encoding` **规范成网关能解码的编码**（`gzip, deflate, br`）：既满足预压缩资源的需求，又保证改写 JS/CSS 时一定解得开；
+- 现代 Chrome 会发 `gzip, deflate, br, zstd`，其中的 `zstd` 会被**剥离**（Node 解码表不含 zstd）。否则上游可能回 zstd，网关解不开却仍按文本改写 → 输出二进制垃圾 → JS 语法错误 → 页面空白；
+- 遇到**未知编码**时一律**原样透传**（保留 `content-encoding`），绝不按 utf8 处理，宁可少改写也不破坏内容；
+- 已知目标依赖压缩协商时，客户端只声明 `identity` 的请求会自动兜底补 `gzip`。
 
 **一键诊断**：`GET /_gate/api/diag`（需已通过 Token）会直接给出 `verdict`：
 

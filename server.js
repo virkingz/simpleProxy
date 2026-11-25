@@ -289,29 +289,50 @@ function forwardCookieHeader(raw, prefix) {
   return keep.length ? keep.join('; ') : null;
 }
 
+// 压缩协商：几乎所有「页面能开、JS/CSS 全 404 (len=146)」都是这个原因 ——
+// 设备（飞牛 fnOS / 部分 Nginx）静态资源只提供 .js.gz / .css.br 预压缩文件，
+// 客户端不声明 gzip/br 就回 404。
+//
+// 同时必须保证「上游用什么编码，网关都能解开」：
+// 现代 Chrome 会发送 `gzip, deflate, br, zstd`，若原样透传，上游可能回 zstd，
+// 而我们要改写 JS/CSS 就必须先解码 —— 因此把 zstd 等 Node 不能解的编码剥掉。
+function sanitizeAcceptEncoding(clientAE, preferGzip) {
+  const parts = String(clientAE || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .map((s) => s.split(';')[0].trim());          // 去掉 q= 权重
+  const ok = ['gzip', 'deflate', 'br'];
+  const keep = [...new Set(parts.filter((p) => ok.includes(p)))];
+  if (keep.length) return keep.join(', ');
+  // 客户端只要 identity（或没声明）：若已知该目标依赖压缩协商，则兜底补 gzip
+  return preferGzip ? 'gzip, deflate, br' : '';
+}
+
+// 统一解码：任何上游返回的压缩体都要能解开（zstd 在 Node 22.15+ 可用）。
+// 返回 null 表示「未知编码，调用方必须原样透传」；
+// 空 / identity 返回恒等函数（明文，无需解码）。
+function makeDecoder(enc) {
+  const e = String(enc || '').toLowerCase().trim();
+  if (e === '' || e === 'identity') return (b) => b;
+  if (e === 'gzip' || e === 'x-gzip') return zlib.gunzipSync;
+  if (e === 'deflate') return zlib.inflateSync;
+  if (e === 'br') return zlib.brotliDecompressSync;
+  if (e === 'zstd' && typeof zlib.zstdDecompressSync === 'function') return zlib.zstdDecompressSync;
+  return null;
+}
+
 function prepareProxyReq(proxyReq, req, target) {
   const prefix = cookiePrefix(target);
   const cookies = forwardCookieHeader(req.headers.cookie, prefix);
   if (cookies) proxyReq.setHeader('Cookie', cookies);
   else proxyReq.removeHeader('Cookie');
 
-  // 压缩协商：几乎所有「页面能开、JS/CSS 全 404 (len=146)」都是这个原因 ——
-  // 设备（飞牛 fnOS / 部分 Nginx）静态资源只提供 .js.gz / .css.br 预压缩文件，
-  // 客户端不声明 gzip/br 就回 404。所以一律保留浏览器的 Accept-Encoding。
-  //
-  // 页面请求例外：我们要解压后注入退出按钮，因此只声明 Node 能解码的
-  // gzip/deflate/br（避免上游回 zstd 导致解不开）。这样即便 HTML 也被压缩，
-  // 注入依然有效；若上游不支持压缩则自动按未压缩返回。
-  const wantsHtml = /text\/html/i.test(String(req.headers.accept || ''));
-  if (wantsHtml) {
-    proxyReq.setHeader('accept-encoding', 'gzip, deflate, br');
-  } else {
-    let ae = String(req.headers['accept-encoding'] || '');
-    // identity/缺省 且已知该目标依赖压缩协商 → 兜底补 gzip
-    if ((!ae || /^\s*identity\s*$/i.test(ae)) && target && target.preferGzip) ae = 'gzip, deflate, br';
-    if (ae && !/^\s*identity\s*$/i.test(ae)) proxyReq.setHeader('accept-encoding', ae);
-    else proxyReq.removeHeader('accept-encoding');
-  }
+  // 页面与资源一律只声明网关能解码的编码（gzip/deflate/br），
+  // 既满足「预压缩静态资源」的需求，又保证我们始终能解开并改写。
+  const ae = sanitizeAcceptEncoding(req.headers['accept-encoding'], target && target.preferGzip);
+  if (ae) proxyReq.setHeader('accept-encoding', ae);
+  else proxyReq.removeHeader('accept-encoding');
 
   // 抹掉会把「网关域名」暴露给目标的头。很多内网服务（Lucky / nginx）
   // 据此做防盗链、Host 白名单或 CSRF 校验，命中即返回 403。
@@ -430,12 +451,13 @@ function handleProxyRes(proxyRes, req, res, target) {
     proxyRes.on('data', (c) => chunks.push(c));
     proxyRes.on('end', () => {
       const buf = Buffer.concat(chunks);
-      const decode = ({ gzip: zlib.gunzipSync, deflate: zlib.inflateSync, br: zlib.brotliDecompressSync }[enc]) || ((b) => b);
-      let body;
-      try {
-        body = decode(buf).toString('utf8');
-      } catch {
-        // 解压失败：保持原编码原样透传（切勿删 content-encoding）
+      const decode = makeDecoder(enc);
+      let body = null;
+      if (decode) {
+        try { body = decode(buf).toString('utf8'); } catch { body = null; }
+      }
+      // 解压失败 / 未知编码：原样透传（保留 content-encoding），绝不改写
+      if (body === null) {
         headers['content-length'] = buf.length;
         res.writeHead(proxyRes.statusCode || 200, headers);
         res.end(buf);
@@ -460,15 +482,16 @@ function handleProxyRes(proxyRes, req, res, target) {
     proxyRes.on('data', (c) => chunks.push(c));
     proxyRes.on('end', () => {
       const buf = Buffer.concat(chunks);
-      const decode = ({ gzip: zlib.gunzipSync, deflate: zlib.inflateSync, br: zlib.brotliDecompressSync }[enc]) || ((b) => b);
-      let out;
-      try {
-        out = Buffer.from(rewrite(decode(buf).toString('utf8')), 'utf8');
-        delete headers['content-encoding'];
-      } catch {
-        // 解压失败：保持原编码原样透传
-        out = buf;
+      const decode = makeDecoder(enc);
+      let out = null;
+      if (decode) {
+        try {
+          out = Buffer.from(rewrite(decode(buf).toString('utf8')), 'utf8');
+          delete headers['content-encoding'];
+        } catch { out = null; }
       }
+      // 解压失败 / 未知编码：原样透传，保持 content-encoding 不变
+      if (out === null) out = buf;
       headers['content-length'] = out.length;
       res.writeHead(proxyRes.statusCode || 200, headers);
       res.end(out);
@@ -557,15 +580,12 @@ function rawFetch(target, path, req, opts = {}) {
   return once(path, follow);
 }
 
-// 按 content-encoding 解码响应体（用于需要读文本的场景）
+// 按 content-encoding 解码响应体（用于需要读文本的场景；解不开就原样返回）
 function decodeBody(r) {
   const enc = String((r.headers && r.headers['content-encoding']) || '').toLowerCase();
-  try {
-    if (enc === 'gzip') return zlib.gunzipSync(r.body);
-    if (enc === 'deflate') return zlib.inflateSync(r.body);
-    if (enc === 'br') return zlib.brotliDecompressSync(r.body);
-  } catch {}
-  return r.body;
+  const decode = makeDecoder(enc);
+  if (!decode) return r.body;
+  try { return decode(r.body); } catch { return r.body; }
 }
 
 // 从目标根页面推断它真实挂在哪个前缀下（跳转 Location / <base> / 资源 src）
@@ -874,7 +894,8 @@ app.get(BASE + '/api/diag', async (req, res) => {
     for (const v of variants) {
       for (const pf of prefixes) {
         for (const proto of protos) {
-          for (const ae of ['gzip, deflate, br', 'identity']) {
+          // 第三项刻意带 zstd：用于识别「上游在现代浏览器下会回 zstd」的情况
+          for (const ae of ['gzip, deflate, br', 'identity', 'gzip, deflate, br, zstd']) {
             const full = joinBase(pf, v) + rpQuery;
             const key = proto + ' ' + full + ' [' + ae + ']';
             if (probes.some((x) => x.key === key)) continue;
@@ -906,18 +927,23 @@ app.get(BASE + '/api/diag', async (req, res) => {
     verdict = 'no-references';
     conclusion = '入口页没有解析到任何站内资源引用，无法进一步判定。';
   } else {
-    // ① 原样路径（无前缀）在两种编码下的结果
+    // ① 原样路径（无前缀）在各编码下的结果
     const samePath = probes.filter((p) => firstRef && p.url === firstRef);
-    const gz = samePath.find((p) => /gzip|br|deflate/i.test(p.acceptEncoding));
-    const idn = samePath.find((p) => /identity/i.test(p.acceptEncoding));
+    const plain = samePath.find((p) => /identity/i.test(p.acceptEncoding));
+    const compressible = samePath.filter((p) => /gzip|br|deflate/i.test(p.acceptEncoding));
+    const gz = compressible.find((p) => /gzip/i.test(p.acceptEncoding));
+    const zst = samePath.find((p) => /zstd/i.test(p.acceptEncoding));
     const prefixHit = probes.find((p) => okProbe(p) && p.url !== firstRef);
+    const best = compressible.find(okProbe);
 
-    if (okProbe(gz) && idn && !okProbe(idn)) {
+    if (okProbe(gz) && plain && !okProbe(plain)) {
       verdict = 'accept-encoding';
       conclusion = `路径与协议都正确，唯一变量是 Accept-Encoding：同一 URL 带 gzip 返回 ${gz.status}，`
-        + `不带（identity）返回 ${idn.status}。目标只提供预压缩静态资源，必须让客户端声明 gzip/br。`;
-      fix = '网关已自动处理（透传 Accept-Encoding），无需修改登录地址。拉取最新镜像即可。';
-    } else if (okProbe(gz) || okProbe(idn)) {
+        + `不带（identity）返回 ${plain.status}。目标只提供预压缩静态资源，必须让客户端声明 gzip/br。`;
+      fix = zst && zst.contentEncoding === 'zstd'
+        ? '目标还会对 zstd 优先响应；网关已剥离 zstd 只请求 gzip/deflate/br，无需修改登录地址。'
+        : '网关已自动处理（透传可解码的 Accept-Encoding），无需修改登录地址。拉取最新镜像即可。';
+    } else if (okProbe(gz) || okProbe(plain) || best) {
       verdict = 'ok';
       conclusion = '原样路径即可取到资源，无需前缀。若浏览器仍 404，检查是否有其他中间层拦截。';
     } else if (prefixHit) {
