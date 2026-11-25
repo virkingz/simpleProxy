@@ -295,18 +295,21 @@ function prepareProxyReq(proxyReq, req, target) {
   if (cookies) proxyReq.setHeader('Cookie', cookies);
   else proxyReq.removeHeader('Cookie');
 
-  // 需要「解压后注入退出按钮」的只有 HTML；JS/CSS 即使压缩也能解码后重写。
-  // 因此只对页面请求强制 identity —— 很多嵌入式设备/精简 Nginx 只提供
-  // .js.gz / .css.br 预压缩文件，客户端不声明 gzip/br 时直接回 404（len=146）。
-  // 静态资源必须原样透传浏览器的 accept-encoding，否则就是「页面能开、JS 全 404」。
-  const isAsset0 = PROBE_ASSET_RE.test(String(req.originalUrl || req.url || ''));
-  if (!isAsset0) {
-    proxyReq.removeHeader('accept-encoding');
-    proxyReq.setHeader('accept-encoding', 'identity');
+  // 压缩协商：几乎所有「页面能开、JS/CSS 全 404 (len=146)」都是这个原因 ——
+  // 设备（飞牛 fnOS / 部分 Nginx）静态资源只提供 .js.gz / .css.br 预压缩文件，
+  // 客户端不声明 gzip/br 就回 404。所以一律保留浏览器的 Accept-Encoding。
+  //
+  // 页面请求例外：我们要解压后注入退出按钮，因此只声明 Node 能解码的
+  // gzip/deflate/br（避免上游回 zstd 导致解不开）。这样即便 HTML 也被压缩，
+  // 注入依然有效；若上游不支持压缩则自动按未压缩返回。
+  const wantsHtml = /text\/html/i.test(String(req.headers.accept || ''));
+  if (wantsHtml) {
+    proxyReq.setHeader('accept-encoding', 'gzip, deflate, br');
   } else {
-    // 已知该目标需要压缩协商才能取到静态资源时，兜底补上 gzip
-    const ae = req.headers['accept-encoding'] || (target && target.preferGzip ? 'gzip, deflate, br' : '');
-    if (ae) proxyReq.setHeader('accept-encoding', String(ae));
+    let ae = String(req.headers['accept-encoding'] || '');
+    // identity/缺省 且已知该目标依赖压缩协商 → 兜底补 gzip
+    if ((!ae || /^\s*identity\s*$/i.test(ae)) && target && target.preferGzip) ae = 'gzip, deflate, br';
+    if (ae && !/^\s*identity\s*$/i.test(ae)) proxyReq.setHeader('accept-encoding', ae);
     else proxyReq.removeHeader('accept-encoding');
   }
 
@@ -554,6 +557,17 @@ function rawFetch(target, path, req, opts = {}) {
   return once(path, follow);
 }
 
+// 按 content-encoding 解码响应体（用于需要读文本的场景）
+function decodeBody(r) {
+  const enc = String((r.headers && r.headers['content-encoding']) || '').toLowerCase();
+  try {
+    if (enc === 'gzip') return zlib.gunzipSync(r.body);
+    if (enc === 'deflate') return zlib.inflateSync(r.body);
+    if (enc === 'br') return zlib.brotliDecompressSync(r.body);
+  } catch {}
+  return r.body;
+}
+
 // 从目标根页面推断它真实挂在哪个前缀下（跳转 Location / <base> / 资源 src）
 async function rootPrefixes(target) {
   // follow: 3 —— 入口常是 302 → /login，不跟随就拿不到真正引用资源的那个页面
@@ -568,7 +582,7 @@ async function rootPrefixes(target) {
   if (r.location) {
     try { add(new URL(r.location, targetOrigin(target)).pathname.split('/').filter(Boolean)[0]); } catch {}
   }
-  const text = r.body.toString('utf8');
+  const text = decodeBody(r).toString('utf8');
   const bm = /<base[^>]+href\s*=\s*["']\/?([^"'\/?#]+)\//i.exec(text);
   if (bm) add(bm[1]);
   const re = /(?:src|href)\s*=\s*["']\/?([^"'\/?#]+)\//gi;
@@ -835,7 +849,7 @@ app.get(BASE + '/api/diag', async (req, res) => {
       bytes: r.body.length,
     });
     if (/text\/html/i.test(String(r.headers['content-type'] || ''))) {
-      const html = r.body.toString('utf8');
+      const html = decodeBody(r).toString('utf8');
       const re = /(?:src|href)\s*=\s*["']([^"']+)["']/gi;
       let m;
       while ((m = re.exec(html))) {
@@ -881,17 +895,54 @@ app.get(BASE + '/api/diag', async (req, res) => {
     }
   }
 
-  const winner = probes.find((p) => p.status >= 200 && p.status < 300 && !/text\/html/i.test(String(p.contentType || '')));
+  // ---- 结论判定：优先级 压缩协商 > 前缀 > 协议 > 确实不存在 ----
+  const okProbe = (p) => p.status >= 200 && p.status < 300 && !/text\/html/i.test(String(p.contentType || ''));
+  const firstRef = rel[0] || null;
+  let verdict = 'unknown';
+  let conclusion = '';
+  let fix = null;
+
+  if (!rel.length) {
+    verdict = 'no-references';
+    conclusion = '入口页没有解析到任何站内资源引用，无法进一步判定。';
+  } else {
+    // ① 原样路径（无前缀）在两种编码下的结果
+    const samePath = probes.filter((p) => firstRef && p.url === firstRef);
+    const gz = samePath.find((p) => /gzip|br|deflate/i.test(p.acceptEncoding));
+    const idn = samePath.find((p) => /identity/i.test(p.acceptEncoding));
+    const prefixHit = probes.find((p) => okProbe(p) && p.url !== firstRef);
+
+    if (okProbe(gz) && idn && !okProbe(idn)) {
+      verdict = 'accept-encoding';
+      conclusion = `路径与协议都正确，唯一变量是 Accept-Encoding：同一 URL 带 gzip 返回 ${gz.status}，`
+        + `不带（identity）返回 ${idn.status}。目标只提供预压缩静态资源，必须让客户端声明 gzip/br。`;
+      fix = '网关已自动处理（透传 Accept-Encoding），无需修改登录地址。拉取最新镜像即可。';
+    } else if (okProbe(gz) || okProbe(idn)) {
+      verdict = 'ok';
+      conclusion = '原样路径即可取到资源，无需前缀。若浏览器仍 404，检查是否有其他中间层拦截。';
+    } else if (prefixHit) {
+      verdict = 'prefix';
+      const seg = '/' + prefixHit.url.split('/').filter(Boolean).slice(0, 1).join('/') + '/';
+      conclusion = `原样路径取不到，但 ${prefixHit.proto} ${prefixHit.url} [${prefixHit.acceptEncoding}] 返回 ${prefixHit.status}，差一个部署前缀。`;
+      fix = `把登录地址改成带路径的形式，例如 <IP>:<端口>${seg}`;
+    } else {
+      const allOk = probes.filter(okProbe);
+      verdict = 'not-found';
+      conclusion = '所有前缀 / 协议 / 压缩组合都取不到这些资源，说明该地址下确实没有这些文件（可能换过端口、或需要先登录鉴权后再访问）。';
+      fix = `请核对浏览器直连该服务时的完整地址（协议 + IP + 端口）；若曾登录过，先直连登录一次再回到网关。`;
+    }
+  }
+
   res.json({
     ok: true,
     target: { protocol: t.protocol, host: t.host, port: t.port, base: t.base },
     entry: seenEntry,
     references: rel,
+    verdict,
+    conclusion,
+    fix,
+    winner: probes.find(okProbe) || null,
     probes,
-    winner: winner || null,
-    hint: winner
-      ? `已找到可用组合：${winner.proto} ${winner.url} [accept-encoding: ${winner.acceptEncoding}]。若是前缀差异，把 "${winner.url.split('/').slice(0, 2).join('/')}/" 填进登录地址的路径。`
-      : '所有组合都失败：说明这些文件在该地址下确实不存在（可能是另一端口/另一台机器，或需要先登录鉴权）。请核对浏览器直连时的完整地址。',
   });
 });
 
