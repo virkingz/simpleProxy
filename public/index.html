@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>内网网关</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --panel:#ffffff; --line:#e6e9f0; --line2:#eef1f7;
+    --txt:#111827; --txt2:#5b6478; --txt3:#98a1b3;
+    --brand:#2f6bff; --brand-d:#2457dd; --danger:#e5484d;
+    --ok:#16a34a; --shadow:0 10px 30px rgba(24,39,75,.08);
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px}
+  .card{width:100%;max-width:400px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:28px}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:22px}
+  .logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#2f6bff,#6f9bff);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:16px}
+  .brand h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
+  .brand p{margin:2px 0 0;font-size:12px;color:var(--txt3)}
+  label{display:block;font-size:12.5px;color:var(--txt2);margin:0 0 7px;font-weight:550}
+  .field{margin-bottom:16px}
+  input[type=text],input[type=password]{
+    width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:10px;
+    font-size:14px;background:#fbfcfe;color:var(--txt);outline:none;transition:.15s;
+    font-family:inherit;
+  }
+  input:focus{border-color:var(--brand);background:#fff;box-shadow:0 0 0 3px rgba(47,107,255,.12)}
+  .hint{font-size:11.5px;color:var(--txt3);margin-top:6px;line-height:1.5}
+  button{font-family:inherit;cursor:pointer;border:0;transition:.15s}
+  .btn{
+    width:100%;padding:11px 14px;border-radius:10px;background:var(--brand);color:#fff;
+    font-size:14px;font-weight:600;
+  }
+  .btn:hover{background:var(--brand-d)}
+  .btn:disabled{opacity:.55;cursor:not-allowed}
+  .row{display:flex;align-items:center;gap:9px;margin-bottom:16px;font-size:13px;color:var(--txt2);cursor:pointer;user-select:none}
+  .row input{width:16px;height:16px;accent-color:var(--brand);cursor:pointer}
+  .err{background:#fef2f2;border:1px solid #fecaca;color:#b42318;font-size:12.5px;padding:9px 11px;border-radius:9px;margin-bottom:14px;display:none;line-height:1.5}
+  .err.show{display:block}
+  .foot{margin-top:18px;font-size:11.5px;color:var(--txt3);text-align:center;line-height:1.6}
+
+  /* ---- 登录页双栏 ---- */
+  .wide{max-width:860px;display:none;width:100%}
+  .wide.on{display:block}
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:20px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .side h2{font-size:13px;margin:0 0 12px;color:var(--txt2);font-weight:600;display:flex;align-items:center;gap:7px}
+  .side h2 span{background:#eef2ff;color:#3b5bdb;font-size:11px;padding:1px 7px;border-radius:999px}
+  .slist{max-height:340px;overflow:auto;display:flex;flex-direction:column;gap:8px}
+  .site{
+    border:1px solid var(--line);border-radius:11px;padding:10px 11px;background:#fbfcfe;
+    display:flex;align-items:center;gap:10px;transition:.15s;
+  }
+  .site:hover{border-color:#c9d6ff;background:#f6f9ff}
+  .site .meta{min-width:0;flex:1;cursor:pointer}
+  .site .nm{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .site .ad{font-size:11.5px;color:var(--txt3);margin-top:2px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .go{padding:6px 11px;border-radius:8px;background:#eef2ff;color:#3b5bdb;font-size:12px;font-weight:600}
+  .go:hover{background:#dfe7ff}
+  .del{padding:6px 8px;border-radius:8px;background:transparent;color:var(--txt3);font-size:13px}
+  .del:hover{background:#fef2f2;color:var(--danger)}
+  .empty{font-size:12.5px;color:var(--txt3);text-align:center;padding:22px 8px;border:1px dashed var(--line);border-radius:11px;line-height:1.7}
+  .spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .hidden{display:none!important}
+</style>
+</head>
+<body>
+
+<!-- ============ Token 门禁 ============ -->
+<div class="wrap" id="v-token">
+  <div class="card">
+    <div class="brand">
+      <div class="logo">G</div>
+      <div>
+        <h1>内网网关</h1>
+        <p>Intranet Gateway</p>
+      </div>
+    </div>
+    <div class="err" id="e-token"></div>
+    <div class="field">
+      <label>访问令牌 Token</label>
+      <input type="password" id="token" placeholder="请输入访问令牌" autocomplete="off" spellcheck="false">
+      <div class="hint">需持有正确的 Token 才能进入网关页面。</div>
+    </div>
+    <button class="btn" id="btn-token">进入</button>
+    <div class="foot">会话保持 12 小时 · 请勿在公共设备保存</div>
+  </div>
+</div>
+
+<!-- ============ 登录页 ============ -->
+<div class="wrap hidden" id="v-login">
+  <div class="wide on">
+    <div class="grid">
+      <div class="card" style="max-width:none">
+        <div class="brand">
+          <div class="logo">G</div>
+          <div>
+            <h1>登录内网服务</h1>
+            <p>输入 内网 IP : 端口，登录后所有请求将代理到该地址</p>
+          </div>
+        </div>
+        <div class="err" id="e-login"></div>
+        <div class="field">
+          <label>目标地址</label>
+          <input type="text" id="target" placeholder="192.168.1.10:8080" autocomplete="off" spellcheck="false">
+          <div class="hint">支持 http / https / WebSocket。省略协议默认 http，例如 <code>10.0.0.5:9000</code>；自签 https 证书将自动忽略校验。</div>
+        </div>
+        <label class="row" style="margin-bottom:12px">
+          <input type="checkbox" id="save">
+          <span>保存此地址，便于下次一键登录</span>
+        </label>
+        <div class="field hidden" id="name-wrap">
+          <label>显示名称（可选）</label>
+          <input type="text" id="name" placeholder="例如：测试服务器 / NAS 后台" autocomplete="off">
+        </div>
+        <button class="btn" id="btn-login">登录并代理</button>
+        <div class="foot">登录后页面底部会显示悬浮「退出」按钮，随时返回本页</div>
+      </div>
+
+      <div class="card side" style="max-width:none;align-self:start">
+        <h2>已保存的地址 <span id="cnt">0</span></h2>
+        <div class="slist" id="slist"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/_gate/api';
+const $ = (id) => document.getElementById(id);
+
+function show(view){
+  $('v-token').classList.toggle('hidden', view !== 'token');
+  $('v-login').classList.toggle('hidden', view !== 'login');
+}
+function err(box, msg){
+  const el = $(box);
+  if (!msg) { el.classList.remove('show'); el.textContent=''; return; }
+  el.textContent = msg; el.classList.add('show');
+}
+async function api(path, opts = {}){
+  const res = await fetch(API + path, {
+    method: opts.method || 'GET',
+    headers: { 'Content-Type': 'application/json' },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    credentials: 'same-origin',
+  });
+  let data = {};
+  try { data = await res.json(); } catch {}
+  return { status: res.status, data };
+}
+
+/* ---------- 初始化：判断当前状态 ---------- */
+(async function init(){
+  const { data } = await api('/me');
+  if (data.authed) { show('login'); loadSites(); }
+  else show('token');
+  $('token').focus();
+})();
+
+/* ---------- Token 校验 ---------- */
+async function submitToken(){
+  const btn = $('btn-token');
+  const token = $('token').value;
+  if (!token) return err('e-token', '请输入 Token');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>校验中';
+  err('e-token', '');
+  const { status, data } = await api('/auth', { method: 'POST', body: { token } });
+  btn.disabled = false; btn.textContent = '进入';
+  if (status === 200 && data.ok) { show('login'); loadSites(); $('target').focus(); }
+  else err('e-token', data.error || 'Token 校验失败');
+}
+$('btn-token').onclick = submitToken;
+$('token').addEventListener('keydown', e => { if (e.key === 'Enter') submitToken(); });
+
+/* ---------- 保存勾选 ---------- */
+$('save').addEventListener('change', e => {
+  $('name-wrap').classList.toggle('hidden', !e.target.checked);
+  if (e.target.checked) $('name').focus();
+});
+
+/* ---------- 登录目标 ---------- */
+async function login(target, save, name){
+  const btn = $('btn-login');
+  const auto = arguments.length === 1; // 来自右侧一键登录
+  if (!auto) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>连接中'; }
+  err('e-login', '');
+  const { status, data } = await api('/login', {
+    method: 'POST',
+    body: { target, save: !!save, name: name || '' },
+  });
+  if (!auto) { btn.disabled = false; btn.textContent = '登录并代理'; }
+  if (status === 200 && data.ok) { location.href = '/'; }
+  else err('e-login', data.error || '登录失败');
+}
+$('btn-login').onclick = () => {
+  const t = $('target').value.trim();
+  if (!t) return err('e-login', '请输入目标地址，例如 192.168.1.10:8080');
+  login(t, $('save').checked, $('name').value.trim());
+};
+$('target').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-login').click(); });
+
+/* ---------- 站点列表 ---------- */
+function fmt(s){
+  const def = (s.protocol === 'http' && s.port === 80) || (s.protocol === 'https' && s.port === 443);
+  const hp = def ? s.host : s.host + ':' + s.port;
+  return (s.protocol === 'https' ? 'https://' : 'http://') + hp;
+}
+function esc(v){ return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function loadSites(){
+  const { status, data } = await api('/sites');
+  if (status === 401) { show('token'); return; }
+  const sites = data.sites || [];
+  $('cnt').textContent = sites.length;
+  const box = $('slist');
+  if (!sites.length) {
+    box.innerHTML = '<div class="empty">还没有保存的地址<br>登录时勾选「保存」即可加入</div>';
+    return;
+  }
+  box.innerHTML = sites.map(s => `
+    <div class="site" data-id="${s.id}">
+      <div class="meta" data-act="go" title="一键登录">
+        <div class="nm">${esc(s.name)}</div>
+        <div class="ad">${esc(fmt(s))}</div>
+      </div>
+      <button class="go" data-act="go">登录</button>
+      <button class="del" data-act="del" title="删除">✕</button>
+    </div>`).join('');
+
+  box.querySelectorAll('.site').forEach(node => {
+    const id = node.dataset.id;
+    const site = sites.find(x => String(x.id) === String(id));
+    node.querySelectorAll('[data-act]').forEach(el => {
+      el.onclick = (ev) => {
+        ev.stopPropagation();
+        if (el.dataset.act === 'go') login(fmt(site), false, site.name);
+        else removeSite(id);
+      };
+    });
+  });
+}
+
+async function removeSite(id){
+  const { status } = await api('/sites/' + id, { method: 'DELETE' });
+  if (status === 200) loadSites();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+services:
+  simpleproxy:
+    build: .
+    image: simpleproxy:latest
+    container_name: simpleproxy
+    restart: unless-stopped
+    ports:
+      - "${GATE_PORT:-8080}:8080"
+    environment:
+      # ⚠ 必须修改：进入网关页所需的访问令牌
+      TOKEN: "${TOKEN:-changeme}"
+      PORT: "8080"
+      DATA_DIR: "/data"
+      # 是否在被代理页面注入右下角悬浮「退出」按钮
+      INJECT_EXIT_BUTTON: "true"
+    volumes:
+      # SQLite 数据持久化（保存的地址列表）
+      - ./data:/data
+    # 若要代理的内网服务跑在宿主机上（如 127.0.0.1:xxxx），
+    # 取消下面注释，容器内即可用 host.docker.internal 访问宿主机
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"

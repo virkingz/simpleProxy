@@ -1,0 +1,18 @@
+{
+  "name": "simpleproxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SimpleProxy - 带 Token 门禁的内网 Web 代理网关：登录后把全部请求代理到指定 内网IP:端口",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --no-warnings server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "http-proxy": "^1.18.1"
+  }
+}
