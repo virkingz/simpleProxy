@@ -25,6 +25,21 @@ const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 小时无操作过期
 const COOKIE_NAME = '_gate_sid';
 const BASE = '/_gate';
 
+// 所有网关响应（含代理透传）一律禁止「共享缓存」。
+// 真实案例：EdgeOne 按 URL 缓存了网关的「未登录 404」，且缓存键不含 Cookie，
+// 于是带会话的浏览器请求 /static/js/*.js 也命中缓存的 404 → 页面空白；
+// 同一会话切换目标时还会命中上一个目标的资源（串味）。
+// 默认 private + no-store 最强；如需放宽可用 CACHE_CONTROL 覆盖，
+// 例如 private, max-age=600（仍禁止 CDN 共享缓存，允许浏览器本地缓存）。
+const CACHE_CONTROL = process.env.CACHE_CONTROL || 'private, no-store, max-age=0, must-revalidate';
+
+// 缓存破坏：给被代理 HTML 里的站内资源 URL 追加会话级参数。
+// CDN 已缓存的旧 404 不会因源站加 no-store 而消失，但缓存键包含 query，
+// 换 URL 即可立刻回源；网关转发前剥离该参数，目标服务完全无感。
+// 设 BUST_CDN_CACHE=false 可关闭。
+const BUST_CDN_CACHE = process.env.BUST_CDN_CACHE !== 'false';
+const BUST_PARAM = '_gw';
+
 /* ------------------------------------------------------------------ *
  * 数据层（SQLite，零原生依赖）
  * ------------------------------------------------------------------ */
@@ -211,6 +226,18 @@ function handleProxyRes(proxyRes, req, res, target) {
   // 因此要剔除上游的分块传输头，否则两者冲突会损坏响应。
   delete headers['transfer-encoding'];
 
+  // 代理响应同样禁止共享缓存：同一 URL 在不同会话可能指向不同目标，
+  // 被 CDN 缓存会导致 404 固化 / 切换目标串味。覆盖上游的
+  // public / s-maxage / immutable / Expires 等缓存指令。
+  delete headers['cache-control'];
+  delete headers['expires'];
+  delete headers['pragma'];
+  delete headers['age'];
+  headers['cache-control'] = CACHE_CONTROL;
+  const vary = String(headers['vary'] || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!vary.some(v => v.toLowerCase() === 'cookie')) vary.push('Cookie');
+  headers['vary'] = vary.join(', ');
+
   // Set-Cookie 改名 + 去掉 Domain，统一挂在网关根路径
   const sc = proxyRes.headers['set-cookie'];
   if (sc) {
@@ -272,7 +299,9 @@ function handleProxyRes(proxyRes, req, res, target) {
         return;
       }
       const rewrite = buildOriginRewriters(target, req.headers.host);
-      const out = Buffer.from(injectExitButton(rewrite(body), target), 'utf8');
+      let html = rewrite(body);
+      if (BUST_CDN_CACHE) html = bustCacheUrls(html, sessionTag(req));
+      const out = Buffer.from(injectExitButton(html, target), 'utf8');
       delete headers['content-encoding'];
       headers['content-length'] = out.length;
       res.writeHead(proxyRes.statusCode || 200, headers);
@@ -333,6 +362,7 @@ function cookiePrefix(t) {
  * 代理调度
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
+  stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
   prepareProxyReqHook(req, target);
   proxy.web(req, res, {
     target: targetOrigin(target),
@@ -368,6 +398,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 function handleUpgrade(req, socket, head) {
   const s = getSession(req);
   if (!s || !s.target) return socket.destroy();
+  stripBustParam(req);
   req.__gate_target = s.target;
   proxy.ws(req, socket, head, {
     target: targetOrigin(s.target),
@@ -382,6 +413,14 @@ function handleUpgrade(req, socket, head) {
  * ------------------------------------------------------------------ */
 const app = express();
 app.disable('x-powered-by');
+
+/* --- 防 CDN / 共享缓存：作用于网关自身所有响应（登录页、API、404） --- */
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', CACHE_CONTROL);
+  res.setHeader('Vary', 'Cookie');
+  next();
+});
+
 app.use(BASE + '/api', express.json({ limit: '64kb' }));
 
 app.use(BASE + '/static', express.static(path.join(__dirname, 'public'), { index: false }));
@@ -481,10 +520,41 @@ app.use((req, res, next) => {
   const s = getSession(req);
   if (s && s.target) return doProxy(req, res, s.target);
   if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) {
-    return res.sendFile(indexPath);
+    // cacheControl:false 避免 Express 覆盖上面设置的 no-store
+    return res.sendFile(indexPath, { cacheControl: false });
   }
   res.status(404).send('Not found. 请先通过网关登录。');
 });
+
+/* ------------------------------------------------------------------ *
+ * CDN 缓存破坏
+ * ------------------------------------------------------------------ */
+// 同一会话内稳定、不同会话不同的短标识（不含真实 sid）
+function sessionTag(req) {
+  const m = /(?:^|;\s*)_gate_sid=([^;]+)/.exec(req.headers.cookie || '');
+  return crypto.createHash('md5').update(m ? m[1] : 'anon').digest('hex').slice(0, 8);
+}
+
+// 只改写「站内」URL（相对路径 / 以 / 开头的绝对路径），外链与伪协议保持原样
+function bustCacheUrls(html, tag) {
+  return html.replace(/\b(src|href|action|poster)\s*=\s*(["'])([^"']+)\2/gi, (all, attr, q, url) => {
+    const u = url.trim();
+    if (!u || /^(?:data:|javascript:|mailto:|blob:|#)/i.test(u)) return all;
+    if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(u)) return all;   // 外链 / 协议相对
+    if (u.includes(BUST_PARAM + '=')) return all;
+    const sep = u.includes('?') ? '&' : '?';
+    return `${attr}=${q}${u}${sep}${BUST_PARAM}=${tag}${q}`;
+  });
+}
+
+// 转发给目标前剥离该参数，目标服务看到的 URL 与原来完全一致
+function stripBustParam(req) {
+  if (!BUST_CDN_CACHE || !req.url) return;
+  const i = req.url.indexOf('?');
+  if (i < 0) return;
+  const kept = req.url.slice(i + 1).split('&').filter(p => !p.startsWith(BUST_PARAM + '='));
+  req.url = req.url.slice(0, i) + (kept.length ? '?' + kept.join('&') : '');
+}
 
 /* ------------------------------------------------------------------ *
  * 页面

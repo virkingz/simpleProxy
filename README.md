@@ -109,6 +109,8 @@ GATE_PORT=8080                   # 宿主机映射端口
 | `INJECT_EXIT_BUTTON` | `true` | 是否向被代理 HTML 注入右下角悬浮退出按钮 |
 | `STRIP_CLIENT_HEADERS` | `true` | 转发给目标时清洗「网关来源」头（`X-Forwarded-*` / `Sec-Fetch-*`）并把 `Referer`/`Origin` 伪装成目标自身。目标做防盗链/Host 校验返回 403 时保持默认即可；设为 `false` 可 A/B 对比 |
 | `PROXY_LOG` | `false` | 设为 `true` 时打印每个代理请求的上游状态码，`docker logs` 可看 4xx/5xx 来自哪一层 |
+| `CACHE_CONTROL` | `private, no-store, max-age=0, must-revalidate` | 所有网关响应（含代理透传）强制使用的缓存头。前面套 CDN 时**必须禁止共享缓存**，否则 404 会被缓存固化。可放宽为 `private, max-age=600`（仍禁 CDN 共享缓存） |
+| `BUST_CDN_CACHE` | `true` | 给被代理 HTML 里的站内资源 URL 追加会话级 `_gw` 参数（转发给目标前自动剥离）。CDN 已缓存旧 404 时无需清缓存即可立刻绕过；设 `false` 关闭 |
 
 ## 使用流程
 
@@ -143,6 +145,14 @@ A：先看 403 的响应头。若是 `Server: nginx` / `Content-Length: 0`，说
 1. 设 `PROXY_LOG=true` 后 `docker compose up -d`，再 `docker logs -f simpleproxy` 看上游状态码；
 2. 用 `STRIP_CLIENT_HEADERS=false` 做 A/B 对比，确认是否由来源头引起；
 3. 若仍 403，检查目标服务自身的访问控制（IP 白名单、安全入口、鉴权 Cookie 的 `Domain`/`Secure` 设置）。
+
+**Q：主文档能打开，但所有 JS/CSS 全部 404（或 403），页面空白，且前面套了 CDN？**
+A：**优先怀疑 CDN 缓存**。若响应头里有 `EO-Cache-Status: HIT` / `Age` / `X-Cache` 之类，说明 CDN 把某次「未登录 404」按 URL 缓存了，且缓存键不含 Cookie——之后带会话的浏览器请求同一 URL 也直接命中缓存的 404，根本不回源。同一会话切换目标时还会命中上一个目标的资源（串味）。
+网关已做两层防护：
+1. 所有响应（含代理透传）强制 `Cache-Control: private, no-store` + `Vary: Cookie`，覆盖上游的 `public` / `immutable` / `s-maxage`，CDN 不再缓存；
+2. 给 HTML 里的站内资源 URL 追加会话级 `_gw` 参数（转发给目标前剥离，目标无感），**已缓存的旧 404 也无需手动清除**即可立刻绕过。
+
+若仍不行，在 CDN 控制台把该域名设为「不缓存 / 遵循源站 Cache-Control」并关闭「缓存 4xx」，然后清除一次缓存；再设 `PROXY_LOG=true` 看 `docker logs` 里上游状态码——若上游本身就是 404/403，则问题在目标服务侧而非网关。
 
 **Q：登录后页面空白，或样式/图片 404？**
 A：通常是目标页面把「自身 origin」硬编码在 HTML/JS/CSS 里（如 `<base href="http://内网IP:端口/">`、`const API="http://内网IP:端口/api"`），
