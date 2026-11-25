@@ -26,6 +26,20 @@ const PROXY_LOG = process.env.PROXY_LOG === 'true';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 小时无操作过期
 const COOKIE_NAME = '_gate_sid';
 const BASE = '/_gate';
+// 构建标识：优先用环境变量（CI 可注入 commit sha），否则用「自身代码内容」的哈希。
+// 用内容哈希的好处：同一次发布内保持不变（不影响浏览器缓存），
+// 一旦代码更新就自动变化 → 参与静态资源缓存破坏参数，
+// 升级镜像后旧的（可能已损坏的）缓存响应会立即失效。
+const BUILD_ID = (() => {
+  const fromEnv = String(process.env.BUILD_ID || process.env.GIT_SHA || process.env.VERSION || '').trim();
+  if (fromEnv) return fromEnv.slice(0, 16);
+  try {
+    const self = fs.readFileSync(fileURLToPath(import.meta.url));
+    return crypto.createHash('sha256').update(self).digest('hex').slice(0, 10);
+  } catch {
+    return 'dev';
+  }
+})();
 
 // 所有网关响应（含代理透传）一律禁止「共享缓存」。
 // 真实案例：EdgeOne 按 URL 缓存了网关的「未登录 404」，且缓存键不含 Cookie，
@@ -588,6 +602,44 @@ function decodeBody(r) {
   try { return decode(r.body); } catch { return r.body; }
 }
 
+/* ---- 自请求：让 diag 能验证「经过网关代理」这条路径本身 ----
+ * 之前 diag 只直连上游，因此永远看不到代理层的问题。这里让网关请求自己，
+ * 完整走一遍「浏览器 → 网关 → 上游 → 改写 → 回写」，把真实链路暴露出来。
+ */
+function selfRequest(path, req, ae) {
+  return new Promise((resolve) => {
+    const r = http.request({
+      host: '127.0.0.1', port: PORT, path, method: 'GET',
+      headers: {
+        cookie: String(req.headers.cookie || ''),
+        accept: '*/*',
+        'accept-encoding': ae || 'gzip, deflate, br, zstd',
+        'user-agent': 'simpleproxy-diag',
+      },
+    }, (up) => {
+      const chunks = [];
+      up.on('data', (c) => chunks.push(c));
+      up.on('end', () => resolve({ statusCode: up.statusCode, headers: up.headers, body: Buffer.concat(chunks) }));
+      up.on('error', () => resolve(null));
+    });
+    r.setTimeout(8000, () => { r.destroy(); resolve(null); });
+    r.on('error', () => resolve(null));
+    r.end();
+  });
+}
+
+// 判断响应体是否「像被当成文本输出的二进制垃圾」（压缩字节被当 utf8 回写）
+function sniffBinary(buf) {
+  const n = Math.min(buf.length, 256);
+  if (!n) return { binary: false, nonPrintable: 0, head: '' };
+  let non = 0;
+  for (let i = 0; i < n; i++) {
+    const b = buf[i];
+    if (b !== 9 && b !== 10 && b !== 13 && (b < 32 || b > 126)) non++;
+  }
+  return { binary: non / n > 0.03, nonPrintable: non, head: buf.slice(0, 120).toString('latin1') };
+}
+
 // 从目标根页面推断它真实挂在哪个前缀下（跳转 Location / <base> / 资源 src）
 async function rootPrefixes(target) {
   // follow: 3 —— 入口常是 302 → /login，不跟随就拿不到真正引用资源的那个页面
@@ -797,6 +849,7 @@ app.get(BASE + '/api/me', (req, res) => {
   const s = getSession(req);
   res.json({
     ok: true,
+    build: BUILD_ID,
     authed: !!(s && s.authed),
     hasTarget: !!(s && s.target),
     target: s && s.target ? { protocol: s.target.protocol, host: s.target.host, port: s.target.port, base: s.target.base } : null,
@@ -916,8 +969,39 @@ app.get(BASE + '/api/diag', async (req, res) => {
     }
   }
 
-  // ---- 结论判定：优先级 压缩协商 > 前缀 > 协议 > 确实不存在 ----
+  // ---- 关键：让 diag 请求「网关自己」，验证真实代理链路 ----
+  // 之前的 diag 只直连上游，看不到代理层；这里完整走一遍代理，
+  // 直接对比「直连上游拿到的资源」与「经网关拿到的资源」是否一致。
   const okProbe = (p) => p.status >= 200 && p.status < 300 && !/text\/html/i.test(String(p.contentType || ''));
+  const viaProxy = [];
+  for (const rp of rel.slice(0, 4)) {
+    const resp = await selfRequest(rp, req, 'gzip, deflate, br, zstd');
+    if (!resp) { viaProxy.push({ url: rp, error: 'gateway unreachable' }); continue; }
+    const enc = String(resp.headers['content-encoding'] || '').toLowerCase();
+    const sniff = sniffBinary(resp.body);
+    viaProxy.push({
+      url: rp,
+      status: resp.statusCode,
+      contentType: resp.headers['content-type'] || null,
+      contentEncoding: enc || null,
+      bytes: resp.body.length,
+      bodyLooksBinary: sniff.binary,
+      head: sniff.head.slice(0, 80),
+    });
+  }
+
+  // 找「直连上游 200、但经网关仍失败或变成二进制垃圾」的项 = 代理层 bug
+  const proxyBroken = [];
+  for (const vp of viaProxy) {
+    if (vp.error || !vp.url) continue;
+    const direct = probes.find((p) => p.url === vp.url && okProbe(p));
+    const proxiedOk = vp.status >= 200 && vp.status < 300 && !/text\/html/i.test(String(vp.contentType || ''));
+    if (proxiedOk && !vp.bodyLooksBinary) continue;              // 代理正常
+    if (direct) proxyBroken.push({ ...vp, directStatus: direct.status, directBytes: direct.bytes });
+    else proxyBroken.push(vp);
+  }
+
+  // ---- 结论判定：优先级 代理层 > 压缩协商 > 前缀 > 协议 > 确实不存在 ----
   const firstRef = rel[0] || null;
   let verdict = 'unknown';
   let conclusion = '';
@@ -926,6 +1010,14 @@ app.get(BASE + '/api/diag', async (req, res) => {
   if (!rel.length) {
     verdict = 'no-references';
     conclusion = '入口页没有解析到任何站内资源引用，无法进一步判定。';
+  } else if (proxyBroken.length) {
+    verdict = 'proxy-path';
+    const one = proxyBroken[0];
+    conclusion = `上游本身可以取到该资源，但「经过网关」后异常：`
+      + `直连 ${one.directStatus ?? '-'}，经网关 ${one.status ?? '-'}`
+      + `${one.bodyLooksBinary ? '，且响应体是二进制垃圾（编码未被正确处理）' : ''}。`
+      + `说明问题在网关的代理/改写环节，而不是路径或目标服务。`;
+    fix = '这是网关自身缺陷，请把完整 JSON 反馈给开发者；临时可设 BUST_CDN_CACHE=false 或 INJECT_EXIT_BUTTON=false 定位是改写还是注入引起。';
   } else {
     // ① 原样路径（无前缀）在各编码下的结果
     const samePath = probes.filter((p) => firstRef && p.url === firstRef);
@@ -967,6 +1059,8 @@ app.get(BASE + '/api/diag', async (req, res) => {
     verdict,
     conclusion,
     fix,
+    viaProxy,
+    proxyBroken,
     winner: probes.find(okProbe) || null,
     probes,
   });
@@ -1027,7 +1121,8 @@ app.use((req, res, next) => {
 // 同一会话内稳定、不同会话不同的短标识（不含真实 sid）
 function sessionTag(req) {
   const m = /(?:^|;\s*)_gate_sid=([^;]+)/.exec(req.headers.cookie || '');
-  return crypto.createHash('md5').update(m ? m[1] : 'anon').digest('hex').slice(0, 8);
+  // 同时混入 BUILD_ID：升级镜像后 tag 必然改变，旧的坏缓存立即失效
+  return crypto.createHash('md5').update((m ? m[1] : 'anon') + '|' + BUILD_ID).digest('hex').slice(0, 8);
 }
 
 // 只改写「站内」URL（相对路径 / 以 / 开头的绝对路径），外链与伪协议保持原样

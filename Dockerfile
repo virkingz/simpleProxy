@@ -13,7 +13,13 @@ LABEL org.opencontainers.image.title="simpleproxy" \
 
 ENV NODE_ENV=production \
     PORT=8080 \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    BUILD_ID=""
+
+# 构建标识（CI 传入 commit sha）：用于静态资源缓存破坏，
+# 每次升级镜像都会让旧的缓存响应立即失效
+ARG BUILD_ID=""
+ENV BUILD_ID=${BUILD_ID}
 
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
