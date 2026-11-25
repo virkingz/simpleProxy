@@ -107,6 +107,8 @@ GATE_PORT=8080                   # 宿主机映射端口
 | `PORT` | `8080` | 容器内监听端口 |
 | `DATA_DIR` | `/data`（镜像内） | SQLite 数据目录 |
 | `INJECT_EXIT_BUTTON` | `true` | 是否向被代理 HTML 注入右下角悬浮退出按钮 |
+| `STRIP_CLIENT_HEADERS` | `true` | 转发给目标时清洗「网关来源」头（`X-Forwarded-*` / `Sec-Fetch-*`）并把 `Referer`/`Origin` 伪装成目标自身。目标做防盗链/Host 校验返回 403 时保持默认即可；设为 `false` 可 A/B 对比 |
+| `PROXY_LOG` | `false` | 设为 `true` 时打印每个代理请求的上游状态码，`docker logs` 可看 4xx/5xx 来自哪一层 |
 
 ## 使用流程
 
@@ -132,6 +134,15 @@ GATE_PORT=8080                   # 宿主机映射端口
 - 未设置 `TOKEN` 时使用默认值 `changeme`，启动会打印告警，请务必修改
 
 ## 常见问题
+
+**Q：主文档能打开，但所有 JS/CSS 全部 403，页面空白？**
+A：先看 403 的响应头。若是 `Server: nginx` / `Content-Length: 0`，说明 **403 来自被代理的目标服务**（网关自身不会返回 403，也不带 `Server: nginx`），
+通常是目标做了 Referer 防盗链、Host 白名单或 Cookie 鉴权。网关默认会清洗 `X-Forwarded-*` / `Sec-Fetch-*` 并把 `Referer`/`Origin` 伪装成目标自身，
+同时不再对 Cookie 值做 URL 编码（早期实现会把 token 里的 `+` `/` `=` 破坏掉导致鉴权失败）。
+排查步骤：
+1. 设 `PROXY_LOG=true` 后 `docker compose up -d`，再 `docker logs -f simpleproxy` 看上游状态码；
+2. 用 `STRIP_CLIENT_HEADERS=false` 做 A/B 对比，确认是否由来源头引起；
+3. 若仍 403，检查目标服务自身的访问控制（IP 白名单、安全入口、鉴权 Cookie 的 `Domain`/`Secure` 设置）。
 
 **Q：登录后页面空白，或样式/图片 404？**
 A：通常是目标页面把「自身 origin」硬编码在 HTML/JS/CSS 里（如 `<base href="http://内网IP:端口/">`、`const API="http://内网IP:端口/api"`），

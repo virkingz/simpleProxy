@@ -17,6 +17,10 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const TOKEN = process.env.TOKEN || 'changeme';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const INJECT_EXIT = process.env.INJECT_EXIT_BUTTON !== 'false';
+// 出站请求是否清洗「网关来源」头（默认开）。403 排查时可设为 false 做 A/B 对比。
+const STRIP_CLIENT_HEADERS = process.env.STRIP_CLIENT_HEADERS !== 'false';
+// 打印每个代理请求的上游状态，便于定位 4xx/5xx 来自哪一层
+const PROXY_LOG = process.env.PROXY_LOG === 'true';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 小时无操作过期
 const COOKIE_NAME = '_gate_sid';
 const BASE = '/_gate';
@@ -140,7 +144,9 @@ const proxy = httpProxy.createProxyServer({
   secure: false,          // 忽略后端自签 https 证书
   ws: true,
   selfHandleResponse: true,
-  xfwd: true,
+  // 不注入 x-forwarded-*：这些头会把「网关域名」暴露给目标，
+  // 很多内网服务（Lucky/nginx 等）据此做来源校验，直接返回 403。
+  xfwd: false,
 });
 
 proxy.on('error', (err, req, res) => {
@@ -152,20 +158,48 @@ proxy.on('error', (err, req, res) => {
   }
 });
 
-/* ---- 出站请求：cookie 命名空间隔离 + 关闭压缩（便于注入） ---- */
+/* ---- 出站请求：cookie 命名空间隔离 + 抹掉网关来源 + 关闭压缩 ---- */
+// 直接按原始字符串过滤 cookie，不做 decode/encode 往返：
+// 早期实现用 parseCookies 解码后再 encodeURIComponent，会把 token 里的
+// `+` `/` `=` 变成 %2B %2F %3D，目标解析失败 → 403。
+function forwardCookieHeader(raw, prefix) {
+  if (!raw) return null;
+  const keep = [];
+  for (const part of raw.split(';')) {
+    const p = part.trim();
+    const i = p.indexOf('=');
+    if (i < 0) continue;
+    const name = p.slice(0, i);
+    if (name.startsWith(prefix)) keep.push(p.slice(prefix.length));
+  }
+  return keep.length ? keep.join('; ') : null;
+}
+
 function prepareProxyReq(proxyReq, req, target) {
   const prefix = cookiePrefix(target);
-  const cookies = parseCookies(req.headers.cookie);
-  const keep = [];
-  for (const [k, v] of Object.entries(cookies)) {
-    if (k.startsWith(prefix)) keep.push(`${k.slice(prefix.length)}=${encodeURIComponent(v)}`);
-  }
-  if (keep.length) proxyReq.setHeader('Cookie', keep.join('; '));
+  const cookies = forwardCookieHeader(req.headers.cookie, prefix);
+  if (cookies) proxyReq.setHeader('Cookie', cookies);
   else proxyReq.removeHeader('Cookie');
 
   // 让上游返回未压缩内容，方便对 HTML 注入退出按钮
   proxyReq.removeHeader('accept-encoding');
   proxyReq.setHeader('accept-encoding', 'identity');
+
+  // 抹掉会把「网关域名」暴露给目标的头。很多内网服务（Lucky / nginx）
+  // 据此做防盗链、Host 白名单或 CSRF 校验，命中即返回 403。
+  // STRIP_CLIENT_HEADERS=false 可关闭，用于 A/B 对比定位问题。
+  if (STRIP_CLIENT_HEADERS) {
+    for (const h of Object.keys(proxyReq.getHeaders())) {
+      if (/^(x-forwarded-|forwarded$|sec-fetch-)/i.test(h)) proxyReq.removeHeader(h);
+    }
+    // 比「删除」更稳：把来源伪装成目标自身，兼容要求 Referer 必须同源的防盗链
+    const tOrigin = targetOrigin(target);
+    proxyReq.setHeader('origin', tOrigin);
+    const ref = String(req.headers.referer || '');
+    let refPath = '/';
+    try { if (ref) refPath = new URL(ref).pathname + new URL(ref).search; } catch {}
+    proxyReq.setHeader('referer', tOrigin + refPath);
+  }
 }
 
 /* ---- 响应：cookie 命名空间隔离 + Location 重写 + HTML 注入 ---- */
@@ -200,6 +234,9 @@ function handleProxyRes(proxyRes, req, res, target) {
   const ctype = String(headers['content-type'] || '');
   const enc = String(headers['content-encoding'] || '').toLowerCase();
   const status = proxyRes.statusCode || 200;
+  if (PROXY_LOG) {
+    console.log(`[proxy] ${req.method} ${req.originalUrl} -> ${status} (${ctype || '-'}, body ${proxyRes.headers['content-length'] ?? 'chunked'})`);
+  }
   // 204/304 及 1xx 无响应体，不能改写、也不能注入
   const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
 
