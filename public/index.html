@@ -63,10 +63,21 @@
   .site .meta{min-width:0;flex:1;cursor:pointer}
   .site .nm{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .site .ad{font-size:11.5px;color:var(--txt3);margin-top:2px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .site .nt{font-size:11.5px;color:#6b7280;margin-top:4px;line-height:1.5;word-break:break-word;white-space:normal}
+  .site .nt::before{content:"备注：";color:#b3bac7}
   .go{padding:6px 11px;border-radius:8px;background:#eef2ff;color:#3b5bdb;font-size:12px;font-weight:600}
   .go:hover{background:#dfe7ff}
+  .ed{padding:6px 8px;border-radius:8px;background:transparent;color:var(--txt3);font-size:12px}
+  .ed:hover{background:#f1f3f9;color:var(--txt2)}
   .del{padding:6px 8px;border-radius:8px;background:transparent;color:var(--txt3);font-size:13px}
   .del:hover{background:#fef2f2;color:var(--danger)}
+  /* 备注内联编辑 */
+  .nt-edit{display:flex;flex-direction:column;gap:7px;width:100%}
+  .nt-edit input{font-size:12.5px;padding:7px 10px;border-radius:8px}
+  .nt-edit .acts{display:flex;gap:7px;justify-content:flex-end}
+  .nt-edit .acts button{font-size:12px;padding:5px 12px;border-radius:8px;font-weight:600}
+  .nt-edit .ok{background:var(--brand);color:#fff}
+  .nt-edit .cancel{background:#eef1f7;color:var(--txt2)}
   .empty{font-size:12.5px;color:var(--txt3);text-align:center;padding:22px 8px;border:1px dashed var(--line);border-radius:11px;line-height:1.7}
   .spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px}
   @keyframes spin{to{transform:rotate(360deg)}}
@@ -121,6 +132,11 @@
         <div class="field hidden" id="name-wrap">
           <label>显示名称（可选）</label>
           <input type="text" id="name" placeholder="例如：测试服务器 / NAS 后台" autocomplete="off">
+        </div>
+        <div class="field hidden" id="note-wrap">
+          <label>备注（可选）</label>
+          <input type="text" id="note" placeholder="用于识别，例如：王掌的机器 / 生产环境" autocomplete="off">
+          <div class="hint">备注会显示在右侧列表，方便区分多个相似地址。</div>
         </div>
         <button class="btn" id="btn-login">登录并代理</button>
         <div class="foot">登录后页面底部会显示悬浮「退出」按钮，随时返回本页</div>
@@ -182,21 +198,22 @@ async function submitToken(){
 $('btn-token').onclick = submitToken;
 $('token').addEventListener('keydown', e => { if (e.key === 'Enter') submitToken(); });
 
-/* ---------- 保存勾选 ---------- */
+/* ---------- 保存勾选：同时展开「名称」与「备注」 ---------- */
 $('save').addEventListener('change', e => {
   $('name-wrap').classList.toggle('hidden', !e.target.checked);
+  $('note-wrap').classList.toggle('hidden', !e.target.checked);
   if (e.target.checked) $('name').focus();
 });
 
 /* ---------- 登录目标 ---------- */
-async function login(target, save, name){
+async function login(target, save, name, note){
   const btn = $('btn-login');
   const auto = arguments.length === 1; // 来自右侧一键登录
   if (!auto) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>连接中'; }
   err('e-login', '');
   const { status, data } = await api('/login', {
     method: 'POST',
-    body: { target, save: !!save, name: name || '' },
+    body: { target, save: !!save, name: name || '', note: note || '' },
   });
   if (!auto) { btn.disabled = false; btn.textContent = '登录并代理'; }
   if (status === 200 && data.ok) { location.href = '/'; }
@@ -205,7 +222,8 @@ async function login(target, save, name){
 $('btn-login').onclick = () => {
   const t = $('target').value.trim();
   if (!t) return err('e-login', '请输入目标地址，例如 192.168.1.10:8080');
-  login(t, $('save').checked, $('name').value.trim());
+  const save = $('save').checked;
+  login(t, save, save ? $('name').value.trim() : '', save ? $('note').value.trim() : '');
 };
 $('target').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-login').click(); });
 
@@ -232,8 +250,10 @@ async function loadSites(){
       <div class="meta" data-act="go" title="一键登录">
         <div class="nm">${esc(s.name)}</div>
         <div class="ad">${esc(fmt(s))}</div>
+        ${s.note ? `<div class="nt">${esc(s.note)}</div>` : ''}
       </div>
       <button class="go" data-act="go">登录</button>
+      <button class="ed" data-act="edit" title="编辑名称/备注">✎</button>
       <button class="del" data-act="del" title="删除">✕</button>
     </div>`).join('');
 
@@ -243,11 +263,47 @@ async function loadSites(){
     node.querySelectorAll('[data-act]').forEach(el => {
       el.onclick = (ev) => {
         ev.stopPropagation();
-        if (el.dataset.act === 'go') login(fmt(site), false, site.name);
+        const act = el.dataset.act;
+        if (act === 'go') login(fmt(site));
+        else if (act === 'edit') openEdit(node, site);
         else removeSite(id);
       };
     });
   });
+}
+
+/* ---------- 内联编辑名称 / 备注 ---------- */
+function openEdit(node, site){
+  const meta = node.querySelector('.meta');
+  const old = meta.innerHTML;
+  meta.style.cursor = 'default';
+  meta.innerHTML = `
+    <div class="nt-edit">
+      <input type="text" class="e-name" value="${esc(site.name)}" placeholder="名称" maxlength="80">
+      <input type="text" class="e-note" value="${esc(site.note || '')}" placeholder="备注（可选）" maxlength="200">
+      <div class="acts">
+        <button class="cancel" type="button">取消</button>
+        <button class="ok" type="button">保存</button>
+      </div>
+    </div>`;
+  const nameIn = meta.querySelector('.e-name');
+  const noteIn = meta.querySelector('.e-note');
+  nameIn.focus();
+  nameIn.setSelectionRange(nameIn.value.length, nameIn.value.length);
+  const close = () => { meta.innerHTML = old; loadSites(); };
+  meta.querySelector('.cancel').onclick = (e) => { e.stopPropagation(); close(); };
+  meta.querySelector('.ok').onclick = (e) => { e.stopPropagation(); saveEdit(site.id, nameIn.value.trim(), noteIn.value.trim()); };
+  [nameIn, noteIn].forEach(inp => inp.addEventListener('click', e => e.stopPropagation()));
+  meta.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveEdit(site.id, nameIn.value.trim(), noteIn.value.trim()); }
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+  });
+}
+
+async function saveEdit(id, name, note){
+  const { status, data } = await api('/sites/' + id, { method: 'PATCH', body: { name, note } });
+  if (status === 200) loadSites();
+  else alert(data.error || '保存失败');
 }
 
 async function removeSite(id){

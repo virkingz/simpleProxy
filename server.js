@@ -30,6 +30,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sites (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     name         TEXT    NOT NULL,
+    note         TEXT    NOT NULL DEFAULT '',
     protocol     TEXT    NOT NULL DEFAULT 'http',
     host         TEXT    NOT NULL,
     port         INTEGER,
@@ -39,16 +40,23 @@ db.exec(`
   );
 `);
 
+// 兼容旧库：老版本没有 note 列，平滑升级
+{
+  const cols = db.prepare('PRAGMA table_info(sites)').all().map((c) => c.name);
+  if (!cols.includes('note')) db.exec("ALTER TABLE sites ADD COLUMN note TEXT NOT NULL DEFAULT ''");
+}
+
 const stmt = {
   list: db.prepare('SELECT * FROM sites ORDER BY last_used_at DESC, id DESC'),
   get: db.prepare('SELECT * FROM sites WHERE id = ?'),
   upsert: db.prepare(`
-    INSERT INTO sites (name, protocol, host, port, created_at, last_used_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO sites (name, note, protocol, host, port, created_at, last_used_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(protocol, host, port)
-    DO UPDATE SET name = excluded.name, last_used_at = excluded.last_used_at
+    DO UPDATE SET name = excluded.name, note = excluded.note, last_used_at = excluded.last_used_at
   `),
   touch: db.prepare('UPDATE sites SET last_used_at = ? WHERE id = ?'),
+  update: db.prepare('UPDATE sites SET name = ?, note = ? WHERE id = ?'),
   del: db.prepare('DELETE FROM sites WHERE id = ?'),
   find: db.prepare('SELECT * FROM sites WHERE protocol = ? AND host = ? AND port = ?'),
 };
@@ -165,6 +173,10 @@ function handleProxyRes(proxyRes, req, res, target) {
   const prefix = cookiePrefix(target);
   const headers = { ...proxyRes.headers };
 
+  // 我们是「收全 → 改写 → 一次性写回」，必须用 Content-Length，
+  // 因此要剔除上游的分块传输头，否则两者冲突会损坏响应。
+  delete headers['transfer-encoding'];
+
   // Set-Cookie 改名 + 去掉 Domain，统一挂在网关根路径
   const sc = proxyRes.headers['set-cookie'];
   if (sc) {
@@ -186,11 +198,27 @@ function handleProxyRes(proxyRes, req, res, target) {
   }
 
   const ctype = String(headers['content-type'] || '');
-  const isHtml = /text\/html/i.test(ctype) && req.method !== 'HEAD';
   const enc = String(headers['content-encoding'] || '').toLowerCase();
+  const status = proxyRes.statusCode || 200;
+  // 204/304 及 1xx 无响应体，不能改写、也不能注入
+  const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
+
+  // 目标站点若下发 CSP / frame 限制，会拦住网关下的资源，直接去掉
+  delete headers['content-security-policy'];
+  delete headers['content-security-policy-report-only'];
+  if (headers['x-frame-options']) delete headers['x-frame-options'];
+
+  if (noBody || req.method === 'HEAD') {
+    res.writeHead(status, headers);
+    return proxyRes.pipe(res);
+  }
+
+  const isHtml = /text\/html/i.test(ctype);
+  // 文本类响应体才做 origin 重写（JS 里常硬编码自身 origin）
+  const isTextLike = /(javascript|ecmascript|text\/css|application\/json|text\/plain)/i.test(ctype);
 
   if (isHtml && INJECT_EXIT) {
-    // 收集 → 解压 → 注入 → 以 identity 回传
+    // 收集 → 解压 → origin 重写 → 注入退出按钮 → 以 identity 回传
     const chunks = [];
     proxyRes.on('data', (c) => chunks.push(c));
     proxyRes.on('end', () => {
@@ -200,15 +228,38 @@ function handleProxyRes(proxyRes, req, res, target) {
       try {
         body = decode(buf).toString('utf8');
       } catch {
-        // 解压失败则原样透传
-        delete headers['content-encoding'];
+        // 解压失败：保持原编码原样透传（切勿删 content-encoding）
         headers['content-length'] = buf.length;
         res.writeHead(proxyRes.statusCode || 200, headers);
         res.end(buf);
         return;
       }
-      const out = Buffer.from(injectExitButton(body, target), 'utf8');
+      const rewrite = buildOriginRewriters(target, req.headers.host);
+      const out = Buffer.from(injectExitButton(rewrite(body), target), 'utf8');
       delete headers['content-encoding'];
+      headers['content-length'] = out.length;
+      res.writeHead(proxyRes.statusCode || 200, headers);
+      res.end(out);
+    });
+    proxyRes.on('error', () => { try { res.end(); } catch {} });
+    return;
+  }
+
+  if (isTextLike && req.method !== 'HEAD') {
+    const rewrite = buildOriginRewriters(target, req.headers.host);
+    const chunks = [];
+    proxyRes.on('data', (c) => chunks.push(c));
+    proxyRes.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      const decode = ({ gzip: zlib.gunzipSync, deflate: zlib.inflateSync, br: zlib.brotliDecompressSync }[enc]) || ((b) => b);
+      let out;
+      try {
+        out = Buffer.from(rewrite(decode(buf).toString('utf8')), 'utf8');
+        delete headers['content-encoding'];
+      } catch {
+        // 解压失败：保持原编码原样透传
+        out = buf;
+      }
       headers['content-length'] = out.length;
       res.writeHead(proxyRes.statusCode || 200, headers);
       res.end(out);
@@ -334,7 +385,8 @@ app.post(BASE + '/api/login', (req, res) => {
   const now = Date.now();
   if (req.body && req.body.save) {
     const name = String(req.body.name || '').trim() || `${target.host}:${target.port}`;
-    stmt.upsert.run(name, target.protocol, target.host, target.port, now, now);
+    const note = String(req.body.note || '').trim();
+    stmt.upsert.run(name, note, target.protocol, target.host, target.port, now, now);
   } else {
     const found = stmt.find.get(target.protocol, target.host, target.port);
     if (found) stmt.touch.run(now, found.id);
@@ -372,6 +424,19 @@ app.delete(BASE + '/api/sites/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+/* --- 编辑已保存站点（名称 / 备注） --- */
+app.patch(BASE + '/api/sites/:id', (req, res) => {
+  const s = getSession(req);
+  if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
+  const id = parseInt(req.params.id, 10);
+  const row = stmt.get.get(id);
+  if (!row) return res.status(404).json({ ok: false, error: '记录不存在' });
+  const name = req.body && req.body.name !== undefined ? String(req.body.name).trim() : row.name;
+  const note = req.body && req.body.note !== undefined ? String(req.body.note).trim() : row.note;
+  stmt.update.run(name || row.name, note, id);
+  res.json({ ok: true });
+});
+
 /* --- 根路径：有目标则代理，否则给登录页 --- */
 const indexPath = path.join(__dirname, 'public', 'index.html');
 app.use((req, res, next) => {
@@ -401,6 +466,56 @@ function injectExitButton(html, target) {
     '<script>(function(){var b=document.getElementById("__gate_exit_btn__");if(!b)return;b.addEventListener("click",function(){if(!confirm("退出代理并返回登录页？"))return;fetch("/_gate/api/logout",{method:"POST"}).then(function(){location.href="/"}).catch(function(){location.href="/"});});})();<' + '/script>';
   if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, script + '</body>');
   return html + script;
+}
+
+/* ------------------------------------------------------------------ *
+ * 响应体 origin 重写
+ *
+ * 很多 Web 应用（尤其 SPA / 前后端分离）会把「自身 origin」硬编码进
+ * HTML 或 JS，例如：
+ *   <script src="http://192.168.1.10:19980/static/app.js">
+ *   const API = "http://192.168.1.10:19980/api";
+ * 浏览器会直连这个内网地址（绕过网关），导致资源 404 / 页面空白。
+ * 这里把所有指向目标 origin 的引用改写成相对路径，强制走网关。
+ * ------------------------------------------------------------------ */
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildOriginRewriters(target, clientHost) {
+  const host = target.host;
+  const port = target.port;
+
+  // 需要覆盖的 authority 写法
+  const authorities = [];
+  if (port) authorities.push(host + ':' + port);
+  authorities.push(host);
+  // 目标写的是本机/容器别名时，同端口下的 127.0.0.1 / localhost 也一并覆盖
+  if (port && /^(127\.0\.0\.1|localhost|0\.0\.0\.0|host\.docker\.internal)$/i.test(host)) {
+    ['127.0.0.1', 'localhost'].forEach((h) => {
+      const a = h + ':' + port;
+      if (!authorities.includes(a)) authorities.push(a);
+    });
+  }
+
+  const alt = authorities.map(escapeRegExp).join('|');
+  // 一次匹配：scheme://authority 或 协议相对 //authority
+  const re = new RegExp(
+    '(https?|wss?):\\/\\/(' + alt + ')(?=[/\\\\\'"\\s)>]|$)|\\/\\/(' + alt + ')(?=[/\\\\\'"\\s)>]|$)',
+    'gi'
+  );
+
+  const gwHost = clientHost || '';
+
+  return (text) =>
+    text.replace(re, (m, scheme) => {
+      // http/https → 丢掉 origin，变成相对路径，强制走网关
+      if (/^https?$/i.test(scheme)) return '';
+      // ws/wss → 指向网关自身（浏览器按当前页协议建立连接）
+      if (/^wss?$/i.test(scheme)) return gwHost ? scheme + '://' + gwHost : '';
+      // 协议相对 //authority → 指向网关自身
+      return gwHost ? '//' + gwHost : '';
+    });
 }
 
 function errorPage(msg) {
