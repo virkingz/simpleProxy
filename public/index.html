@@ -82,14 +82,6 @@
   .spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px}
   @keyframes spin{to{transform:rotate(360deg)}}
   .hidden{display:none!important}
-  /* 代理方式选择 */
-  .modes{display:flex;flex-direction:column;gap:8px}
-  .mode{display:flex;align-items:flex-start;gap:9px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;cursor:pointer;transition:.15s;background:#fbfcfe}
-  .mode:hover{border-color:#c9d6ff;background:#f6f9ff}
-  .mode input{margin-top:2px;width:15px;height:15px;accent-color:var(--brand);cursor:pointer}
-  .mode .mt{font-size:13px;font-weight:600;display:block}
-  .mode .md{font-size:11.5px;color:var(--txt3);display:block;margin-top:2px;line-height:1.5}
-  .mode:has(input:checked){border-color:var(--brand);background:#f2f6ff}
 </style>
 </head>
 <body>
@@ -132,27 +124,6 @@
           <label>目标地址</label>
           <input type="text" id="target" placeholder="192.168.1.10:8080 或 10.0.0.5:9000/wangzhang/" autocomplete="off" spellcheck="false">
           <div class="hint">支持 http / https / WebSocket，省略协议默认 http；自签 https 证书自动忽略校验。<br>服务挂在子路径时把路径一起填上，例如 <code>10.0.0.5:9000/wangzhang/</code>；静态资源若在别的目录，网关会自动探测。</div>
-        </div>
-        <div class="field">
-          <label>代理方式</label>
-          <div class="modes">
-            <label class="mode">
-              <input type="radio" name="mode" value="transparent" checked>
-              <span class="mt">透明代理（推荐）</span>
-              <span class="md">nginx 风格：内容一字不改原样转发，兼容性最好，复杂前端（Vite/动态 import）首选</span>
-            </label>
-            <label class="mode">
-              <input type="radio" name="mode" value="path">
-              <span class="mt">路径代理</span>
-              <span class="md">会改写页面里的资源地址；仅在目标不能直接访问、必须改路径时使用</span>
-            </label>
-            <label class="mode">
-              <input type="radio" name="mode" value="port">
-              <span class="mt">端口转发</span>
-              <span class="md">另开专属端口（http 场景可用；目标为 https 时可能遇混合内容问题）</span>
-            </label>
-          </div>
-          <div class="hint" id="mode-hint">页面空白时优先用「透明代理」；它不改写任何 HTML/JS，可从根上避免改写导致的故障。</div>
         </div>
         <label class="row" style="margin-bottom:12px">
           <input type="checkbox" id="save">
@@ -207,9 +178,7 @@ async function api(path, opts = {}){
 /* ---------- 初始化：判断当前状态 ---------- */
 (async function init(){
   const { data } = await api('/me');
-  PF_OK = !!data.portForward;
-  TRANS_OK = !!data.transparent;
-  if (data.authed) { show('login'); applyModeSupport(); loadSites(); }
+  if (data.authed) { show('login'); loadSites(); }
   else show('token');
   $('token').focus();
 })();
@@ -236,55 +205,19 @@ $('save').addEventListener('change', e => {
   if (e.target.checked) $('name').focus();
 });
 
-/* ---------- 代理方式 ---------- */
-function curMode(){ const el = document.querySelector('input[name=mode]:checked'); return el ? el.value : 'transparent'; }
-let PF_OK = false;       // 服务端是否支持端口转发
-let TRANS_OK = false;    // 服务端是否支持透明代理
-
-function setRadio(value, enabled){
-  const el = document.querySelector(`input[name=mode][value=${value}]`);
-  if (!el) return;
-  el.disabled = !enabled;
-  if (!enabled && el.checked) {
-    const fb = document.querySelector(`input[name=mode][value=${TRANS_OK ? 'transparent' : 'path'}]`);
-    if (fb && !fb.disabled) fb.checked = true;
-  }
-}
-
-function applyModeSupport(){
-  setRadio('transparent', TRANS_OK);
-  setRadio('port', PF_OK);
-  setRadio('path', true);
-  const hint = $('mode-hint');
-  if (hint) {
-    const missing = [];
-    if (!TRANS_OK) missing.push('透明代理');
-    if (!PF_OK) missing.push('端口转发');
-    hint.textContent = missing.length
-      ? `当前网关未启用：${missing.join('、')}（可用 TRANSPARENT / PORT_FORWARD 环境变量开启），将使用可用模式。`
-      : '页面空白时优先用「透明代理」；它不改写任何 HTML/JS，可从根上避免改写导致的故障。';
-  }
-}
-
 /* ---------- 登录目标 ---------- */
-async function login(target, save, name, note, mode){
+// 统一使用透明代理（nginx 风格零改写）：内容一字不改，兼容性最好。
+async function login(target, save, name, note){
   const btn = $('btn-login');
   const auto = arguments.length === 1; // 来自右侧一键登录
   if (!auto) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>连接中'; }
   err('e-login', '');
-  const useMode = mode || curMode();
   const { status, data } = await api('/login', {
     method: 'POST',
-    body: { target, save: !!save, name: name || '', note: note || '', mode: useMode },
+    body: { target, save: !!save, name: name || '', note: note || '', mode: 'transparent' },
   });
   if (!auto) { btn.disabled = false; btn.textContent = '登录并代理'; }
   if (status === 200 && data.ok) {
-    // 端口转发：跳到专属端口（原样转发，零改写）
-    if (data.mode === 'port' && data.pfPort) {
-      const host = data.pfHost || location.hostname;
-      location.href = `${location.protocol}//${host}:${data.pfPort}/`;
-      return;
-    }
     location.href = '/';
   } else err('e-login', data.error || '登录失败');
 };
@@ -292,7 +225,7 @@ $('btn-login').onclick = () => {
   const t = $('target').value.trim();
   if (!t) return err('e-login', '请输入目标地址，例如 192.168.1.10:8080');
   const save = $('save').checked;
-  login(t, save, save ? $('name').value.trim() : '', save ? $('note').value.trim() : '', curMode());
+  login(t, save, save ? $('name').value.trim() : '', save ? $('note').value.trim() : '');
 };
 $('target').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-login').click(); });
 

@@ -391,10 +391,25 @@ function makeDecoder(enc) {
 }
 
 function prepareProxyReq(proxyReq, req, target) {
-  const prefix = cookiePrefix(target);
-  const cookies = forwardCookieHeader(req.headers.cookie, prefix);
-  if (cookies) proxyReq.setHeader('Cookie', cookies);
-  else proxyReq.removeHeader('Cookie');
+  // Cookie 处理取决于模式：
+  //  · 透明代理 / 端口转发：**原样透传**。目标自己的会话 cookie（如 token=...）
+  //    必须完整送达，否则目标每次请求都认为未登录 →「登录已过期」。
+  //    这两种模式下响应侧的 Set-Cookie 也是原样回传的，所以浏览器里存的就是
+  //    目标原生的 cookie，直接透传即可闭环。
+  //  · 路径代理：多个目标共用同一域名，必须用前缀隔离，避免 cookie 串味。
+  if (target.mode === 'transparent' || req.__pf_port) {
+    // 只剔除网关自身的会话 cookie（避免泄漏给目标/被目标覆盖），其余原样透传
+    const raw = String(req.headers.cookie || '');
+    const kept = raw.split(';').map((s) => s.trim()).filter(Boolean)
+      .filter((p) => !p.startsWith(COOKIE_NAME + '='));
+    proxyReq.removeHeader('Cookie');
+    if (kept.length) proxyReq.setHeader('Cookie', kept.join('; '));
+  } else {
+    const prefix = cookiePrefix(target);
+    const cookies = forwardCookieHeader(req.headers.cookie, prefix);
+    if (cookies) proxyReq.setHeader('Cookie', cookies);
+    else proxyReq.removeHeader('Cookie');
+  }
 
   // 页面与资源一律只声明网关能解码的编码（gzip/deflate/br），
   // 既满足「预压缩静态资源」的需求，又保证我们始终能解开并改写。
@@ -1061,6 +1076,10 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 function injectOnlyHtml(proxyRes, req, res, target) {
   const headers = { ...proxyRes.headers };
   const enc = String(headers['content-encoding'] || '').toLowerCase();
+  // 我们要「收全 → 注入 → 一次性写回」，因此必须改用 Content-Length。
+  // 若保留上游的 transfer-encoding: chunked，会出现
+  // 「Content-Length can't be present with Transfer-Encoding」协议错误。
+  delete headers['transfer-encoding'];
   const chunks = [];
   proxyRes.on('data', (c) => chunks.push(c));
   proxyRes.on('end', () => {
@@ -1070,6 +1089,7 @@ function injectOnlyHtml(proxyRes, req, res, target) {
     if (decode) { try { body = decode(buf).toString('utf8'); } catch { body = null; } }
     // 解不开（未知编码）→ 原样透传，宁可不注入也不破坏
     if (body === null) {
+      headers['content-length'] = buf.length;
       res.writeHead(proxyRes.statusCode || 200, headers);
       res.end(buf);
       return;
@@ -1137,9 +1157,9 @@ app.post(BASE + '/api/login', async (req, res) => {
   const target = normalizeTarget((req.body && req.body.target) || '');
   if (!target) return res.status(400).json({ ok: false, error: '地址格式不正确，示例：192.168.1.10:8080' });
 
-  // 代理模式：transparent（nginx 风格、零改写，推荐）/ path（路径代理 + 改写）
-  const reqMode = String((req.body && req.body.mode) || 'path');
-  target.mode = reqMode === 'transparent' && TRANSPARENT ? 'transparent' : 'path';
+  // 代理模式：transparent（nginx 风格、零改写，默认）/ path（路径代理 + 改写）
+  const reqMode = String((req.body && req.body.mode) || 'transparent');
+  target.mode = reqMode === 'path' ? 'path' : 'transparent';
 
   s.target = target;
   s.lastSeen = Date.now();
