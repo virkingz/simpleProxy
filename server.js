@@ -1766,16 +1766,32 @@ function injectExitButton(html, target, opts = {}) {
     'try{return wipe();}catch(e){return null;}' +
     '}).then(once,once);' +
     '}' +
-    'var armTimer=null;' +
-    'function disarm(){if(d.getAttribute("data-armed")==="1"){d.setAttribute("data-armed","0");' +
-    'd.className="";t.textContent=LABEL+" | "+ACT;}}' +
+    'var armTimer=null,armed=false;' +
+    // 取消「待确认」态：必须同时复位 DOM 与武装变量 armed，
+    // 否则超时/拖动取消后 armed 仍为 true，下一次点击会**直接退出**（漏点一次确认）。
+    'function disarm(){armed=false;d.setAttribute("data-armed","0");' +
+    'd.className="";t.textContent=LABEL+" | "+ACT;}' +
     // ---- 拖动：Pointer Events + setPointerCapture，鼠标/触摸通用 ----
     // 阈值 4px：小于阈值算点击（避免手抖误判为拖动）；拖动后吞掉随后的 click，
     // 并取消「待确认」态 —— 否则「拖完再点」会误退出。
-    'var drag=false,mv=false,sx=0,sy=0,ox=0,oy=0,suppress=false,TH=4;' +
+    //
+    // ⚠️ 关键坑：一旦调用 setPointerCapture，浏览器会把后续的 **click 事件
+    // 也重定向到「被捕获的元素」**。我们必须捕获在容器 d 上（拖动时指针移出
+    // 元素也要能收到 move），因此 click 的 target 会变成 d，而**不是 <button> b**。
+    // 若把点击处理绑在 b 上（早期实现），就会「点不动」。
+    // 解法：点击判定放在 **pointerup**（捕获元素 d 一定能收到），click 仅作
+    // 键盘/无障碍兜底。用 __fromPointer 标记避免一次操作触发两次。
+    'var drag=false,mv=false,sx=0,sy=0,ox=0,oy=0,suppress=false,TH=4,fromPtr=false;' +
+    'function tap(){' +
+    'if(armed){doExit();return;}' +
+    'armed=true;d.setAttribute("data-armed","1");d.className="__g_armed";t.textContent=ARM;' +
+    'if(armTimer)clearTimeout(armTimer);' +
+    'armTimer=setTimeout(disarm,4000);' +
+    '}' +
     'd.addEventListener("pointerdown",function(e){' +
     'if(e.button&&e.button!==0)return;' +
-    'drag=true;mv=false;sx=e.clientX;sy=e.clientY;' +
+    'drag=true;mv=false;fromPtr=false;' +   // 每次按下都复位，防止某次 click 未触发导致后续被误吞
+    'sx=e.clientX;sy=e.clientY;' +
     'var r=d.getBoundingClientRect();ox=r.left;oy=r.top;' +
     'try{d.setPointerCapture(e.pointerId);}catch(_){}});' +
     'd.addEventListener("pointermove",function(e){' +
@@ -1794,17 +1810,26 @@ function injectExitButton(html, target, opts = {}) {
     'd.addEventListener("pointerup",function(e){' +
     'if(!drag)return;drag=false;' +
     'try{d.releasePointerCapture(e.pointerId);}catch(_){}' +
-    'if(mv){suppress=true;disarm();}});' +
+    'fromPtr=true;' +                      // 标记：本次操作由指针完成，忽略随后的 click
+    'var self=(e.target===b||b.contains(e.target));' +  // 点在按钮（或没被重定向到 d）上
+    'if(mv){suppress=true;disarm();return;}' +           // 拖动：不算点击
+    'if(self||e.target===d||d.contains(e.target)){tap();}' +  // 纯点击（含被捕获重定向到 d 的情况）
+    '});' +
     'd.addEventListener("pointercancel",function(){drag=false;});' +
-    // ---- 两步确认：不使用浏览器 confirm()（可能被「阻止此页面创建更多对话框」
-    // 静默拦掉导致点击毫无反应）。改为按钮自身二次确认，纯 DOM，不依赖弹窗。 ----
+    // 两步确认：不使用浏览器 confirm()（可能被「阻止此页面创建更多对话框」
+    // 静默拦掉导致点击毫无反应）。改为自身二次确认，纯 DOM，不依赖弹窗。
+    // 这里的 click 只用于「键盘 Enter/Space」等非指针激活；指针点击已在 pointerup 处理。
     'b.addEventListener("click",function(e){' +
     'e.preventDefault();e.stopPropagation();' +
+    'if(fromPtr){fromPtr=false;return;}' +   // 指针已处理，避免重复触发
     'if(suppress){suppress=false;return;}' +
-    'if(d.getAttribute("data-armed")==="1"){doExit();return;}' +
-    'd.setAttribute("data-armed","1");d.className="__g_armed";t.textContent=ARM;' +
-    'if(armTimer)clearTimeout(armTimer);' +
-    'armTimer=setTimeout(disarm,4000);' +
+    'tap();' +
+    '});' +
+    'd.addEventListener("click",function(e){' +   // 捕获异常时的兜底：click 落在容器上
+    'e.preventDefault();e.stopPropagation();' +
+    'if(fromPtr){fromPtr=false;return;}' +
+    'if(suppress){suppress=false;return;}' +
+    'tap();' +
     '});' +
     'return d;}' +
     'function mount(){' +
