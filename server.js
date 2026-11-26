@@ -308,6 +308,57 @@ function stmtFor(s) { return s && s.decoy ? stmtDecoy : stmt; }
  * ------------------------------------------------------------------ */
 const sessions = new Map(); // sid -> { authed, target, createdAt, lastSeen }
 
+/* ---- 会话数量上限（防内存 DoS）----
+ * 每次无 Cookie 的 POST /auth 都会新建会话；若不设上限，攻击者可无成本刷爆
+ * sessions Map（清理任务 60s 一轮、TTL 12h，回收不及）。
+ * 策略：超过软上限时**立即淘汰**最久未活跃的会话，且**优先淘汰未认证**的
+ * （诱饵/未完成登录的会话最没有保留价值）。真实已登录会话尽量保留，避免误伤。
+ * 硬上限：连同已认证会话一起淘汰，保证内存绝不越界。*/
+const MAX_SESSIONS = Math.max(64, parseInt(process.env.MAX_SESSIONS || '2000', 10) || 2000);
+const MAX_PENDING_SESSIONS = Math.max(32, parseInt(process.env.MAX_PENDING_SESSIONS || '500', 10) || 500);
+
+// 溢出淘汰：先清未认证（含诱饵）中最久未用的，再清全部中最久未用的
+function enforceSessionLimits() {
+  if (sessions.size <= MAX_SESSIONS) {
+    // 仅在「未认证会话」过多时做一次轻量清理
+    if (sessions.size <= MAX_PENDING_SESSIONS) return;
+    const pend = [];
+    for (const [sid, s] of sessions) if (!s.authed) pend.push([sid, s.lastSeen]);
+    if (pend.length <= MAX_PENDING_SESSIONS) return;
+    pend.sort((a, b) => a[1] - b[1]);
+    const drop = pend.length - MAX_PENDING_SESSIONS;
+    for (let i = 0; i < drop; i++) {
+      if (typeof pfRelease === 'function') pfRelease(sessions.get(pend[i][0]));
+      sessions.delete(pend[i][0]);
+    }
+    return;
+  }
+  // 超过硬上限：先淘汰未认证的，仍不够再按最久未用淘汰全部
+  const pending = [], all = [];
+  for (const [sid, s] of sessions) {
+    all.push([sid, s.lastSeen]);
+    if (!s.authed) pending.push([sid, s.lastSeen]);
+  }
+  pending.sort((a, b) => a[1] - b[1]);
+  let need = sessions.size - MAX_SESSIONS;
+  for (const [sid] of pending) {
+    if (need <= 0) break;
+    if (typeof pfRelease === 'function') pfRelease(sessions.get(sid));
+    sessions.delete(sid);
+    need--;
+  }
+  if (need > 0) {
+    all.sort((a, b) => a[1] - b[1]);
+    for (const [sid] of all) {
+      if (need <= 0) break;
+      if (!sessions.has(sid)) continue;
+      if (typeof pfRelease === 'function') pfRelease(sessions.get(sid));
+      sessions.delete(sid);
+      need--;
+    }
+  }
+}
+
 function parseCookies(header) {
   const out = {};
   if (!header) return out;
@@ -324,6 +375,8 @@ function getSession(req, res, create = false) {
   let sid = cookies[COOKIE_NAME];
   let s = sid && sessions.get(sid);
   if (!s && create) {
+    // 先按上限腾位（淘汰最久未活跃 / 优先未认证的），再新建，避免 Map 无界增长
+    enforceSessionLimits();
     sid = crypto.randomUUID().replace(/-/g, '');
     s = { sid, authed: false, decoy: false, target: null, tgtCookies: [], createdAt: Date.now(), lastSeen: Date.now() };
     sessions.set(sid, s);

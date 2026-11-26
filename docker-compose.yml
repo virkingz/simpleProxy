@@ -36,6 +36,9 @@ services:
       # 网关自身安全响应头（不上到被代理内容）。直连内网时保持 TRUST_PROXY=false。
       SECURITY_HEADERS: "${SECURITY_HEADERS:-true}"
       TRUST_PROXY: "${TRUST_PROXY:-false}"
+      # 会话数量上限（防无 Cookie 狂刷 /auth 撑爆内存）
+      MAX_PENDING_SESSIONS: "${MAX_PENDING_SESSIONS:-500}"
+      MAX_SESSIONS: "${MAX_SESSIONS:-2000}"
       # 排查用：打印「实际转发路径 + 上游状态码」，并给响应加 X-Gate-* 诊断头
       PROXY_LOG: "${PROXY_LOG:-false}"
       # 通用子路径：静态资源在根路径被上游判 404 时自动探测真实前缀

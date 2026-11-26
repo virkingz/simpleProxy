@@ -169,6 +169,8 @@ GATE_PORT=8080                   # 宿主机映射端口
 | `AUTH_SILENT_MAX_DELAY_MS` | `4000` | 静默节流延迟上限（毫秒） |
 | `AUTH_LOCK_BASE_MS` | `1000` | **仅当 `AUTH_DECOY=false`**：失败后的指数退避基准时长（毫秒），上限 5 分钟 |
 | `AUTH_FAIL_WINDOW_MS` | `900000` | 失败/尝试计数窗口（毫秒，默认 15 分钟） |
+| `MAX_PENDING_SESSIONS` | `500` | **未认证会话**（含诱饵）数量上限。超过时按「最久未活跃」即时淘汰。防止无 Cookie 狂刷 `/auth` 撑爆内存 |
+| `MAX_SESSIONS` | `2000` | 会话总数硬上限。超过时优先淘汰未认证会话，仍超出则连已登录会话一起按最久未用淘汰，保证内存绝不无界增长 |
 | `SECURITY_HEADERS` | `true` | 是否给**网关自身**页面下发安全响应头（`X-Frame-Options: DENY`、CSP、nosniff、Referrer-Policy、HSTS）。**不会加到被代理的内容上**，透明代理「零改写」不受影响 |
 | `HSTS_MAX_AGE` | `15552000` | HSTS 有效期（秒，默认 180 天）。仅在 HTTPS 请求下下发；设 `0` 关闭 |
 | `TRUST_PROXY` | `false` | 网关前有 CDN/反代时设为 `true`，才会采信 `X-Forwarded-For` / `X-Forwarded-Proto`（影响限速取 IP 与 `Secure` 判定、HSTS）。直连内网时保持 `false`，否则这些头可被伪造 |
@@ -223,6 +225,9 @@ Token 是唯一凭证，因此对**在线爆破**做了专门设计（`AUTH_DECO
   也不会出现「你是诱饵」的破绽。
 - **静默节流**：高频尝试只会被**拉长响应时间**，不返回 401/429，
   且计数**与 token 对错无关**（成功后也不复位）—— 避免「耗时差异 / 计数变化」形成预言机。
+- **会话数量上限（防内存 DoS）**：每次无 Cookie 的 `POST /auth` 都会新建会话，
+  因此对**未认证会话**（`MAX_PENDING_SESSIONS`）和**会话总数**（`MAX_SESSIONS`）设了上限。
+  超限时按「最久未活跃」即时淘汰，且**优先淘汰未认证会话**，尽量不误伤正在使用的登录会话。
 
 > 注意：诱饵只是让爆破「不出声、不收敛」，**它不能降低爆破可行性**。
 > 真正的防线是 **Token 的熵值** —— 请使用足够长的随机串，例如 `openssl rand -hex 24`。
