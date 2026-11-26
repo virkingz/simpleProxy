@@ -1100,16 +1100,35 @@ function stripMetaCsp(html) {
 
 // 把一个「非 HTML」的文本响应包成最小合法 HTML，以便挂载退出按钮。
 // 仅用于 text/plain、无 content-type 等纯文本场景；HTML 原样传入。
+//
+// 重要：这里必须**忠实还原浏览器原生渲染纯文本的样子**，否则用户会发现
+// 「内容格式和直连不一样」。浏览器对 text/plain 的默认样式是：
+//   · 等宽字体（monospace），约 13px；
+//   · 默认 8px 页边距，白底、黑字；
+//   · 换行/空格原样保留。
+// 因此这里用 <pre> + 等价的内联样式，并显式声明页边距与字体，
+// 做到「除了右下角多一个退出按钮，其余与直连完全一致」。
 function wrapPlainTextAsHtml(text) {
   const esc = String(text)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return '<!doctype html><html lang="zh"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    '<title>代理响应</title></head>' +
-    '<body style="margin:0;padding:28px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;' +
-    'color:#0f172a;background:#f8fafc;line-height:1.7">' +
-    '<pre style="white-space:pre-wrap;word-break:break-word;margin:0">' + esc + '</pre>' +
+    '<title>代理响应</title>' +
+    // 复刻浏览器对纯文本的默认样式：仅 body 有 8px 边距、等宽 13px、白底黑字
+    '<style>html{margin:0;padding:0}body{margin:8px;padding:0;background:#fff;color:#000}' +
+    'pre{margin:0;font-family:monospace;font-size:13px;line-height:1.35;' +
+    'white-space:pre-wrap;word-break:break-word}</style></head>' +
+    '<body><pre>' + esc + '</pre>' +
     '</body></html>';
+}
+
+// 按 content-type 里声明的字符集解码文本（缺省 utf-8）。
+// 纯文本页面可能是 gbk 等编码，直接用 utf8 会乱码。
+function decodeText(buf, contentType) {
+  const m = /charset\s*=\s*["']?([\w-]+)/i.exec(String(contentType || ''));
+  const cs = (m ? m[1] : 'utf-8').toLowerCase();
+  if (cs === 'utf-8' || cs === 'utf8') return buf.toString('utf8');
+  try { return new TextDecoder(cs).decode(buf); } catch { return buf.toString('utf8'); }
 }
 
 // 透明模式专用：只注入退出按钮，绝不改写其它内容
@@ -1132,15 +1151,17 @@ function injectOnlyHtml(proxyRes, req, res, target) {
   proxyRes.on('end', () => {
     const buf = Buffer.concat(chunks);
     const decode = makeDecoder(enc);
-    let body = null;
-    if (decode) { try { body = decode(buf).toString('utf8'); } catch { body = null; } }
+    let raw = null;
+    if (decode) { try { raw = decode(buf); } catch { raw = null; } }
     // 解不开（未知编码）→ 原样透传，宁可不注入也不破坏
-    if (body === null) {
+    if (raw === null) {
       headers['content-length'] = buf.length;
       res.writeHead(proxyRes.statusCode || 200, headers);
       res.end(buf);
       return;
     }
+    // 按 content-type 声明的字符集解码（纯文本可能是 gbk，用 utf8 会乱码）
+    let body = decodeText(raw, ctype0);
     let text = stripMetaCsp(body);
     // 非 HTML（如目标错误页的纯文本 "Are you ok?"）→ 包成 HTML，
     // 否则没有 </body> 可挂，用户既看不到内容也没有退出按钮。
