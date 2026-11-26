@@ -101,6 +101,28 @@ setInterval(() => {
   }
 }, 60 * 1000).unref?.();
 
+/* ---- /api/navigate 限流（未鉴权端点，防止刷日志 / 探测）---- */
+const NAV_RATE_MAX = parseInt(process.env.NAVIGATE_RATE_MAX || '10', 10);       // 窗口内最大次数
+const NAV_RATE_WINDOW_MS = parseInt(process.env.NAVIGATE_RATE_WINDOW_MS || '60000', 10); // 窗口长度
+const navHits = new Map();   // ip -> { count, firstAt }
+// 返回需要等待的毫秒数（0 = 放行）
+function navigateRateLimit(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  let rec = navHits.get(ip);
+  if (!rec || now - rec.firstAt > NAV_RATE_WINDOW_MS) rec = { count: 0, firstAt: now };
+  rec.count++;
+  navHits.set(ip, rec);
+  if (rec.count <= NAV_RATE_MAX) return 0;
+  return rec.firstAt + NAV_RATE_WINDOW_MS - now;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of navHits) {
+    if (now - rec.firstAt > NAV_RATE_WINDOW_MS) navHits.delete(ip);
+  }
+}, 60 * 1000).unref?.();
+
 // 是否启用安全响应头（可关，便于 A/B 排查被代理站点异常）
 const SECURITY_HEADERS = process.env.SECURITY_HEADERS !== 'false';
 // HSTS 仅在有把握全程 HTTPS 时生效（默认开）。内网 HTTP 直连访问不受影响 —— HSTS 只由浏览器在 HTTPS 响应后记录。
@@ -360,31 +382,40 @@ function targetOrigin(t) {
   return `${t.protocol}://${t.host}${isDefault ? '' : ':' + t.port}`;
 }
 
-// 判断主机是否为「内网 / 私有 / 本机」地址。
-// 用于「导航模式」的安全闸：默认只允许跳到这类地址，避免网关被当作公网钓鱼跳板。
-function isPrivateHost(host) {
+// 判断主机是否为「允许跳转的内网地址」。
+// 用于「未通过校验的访客」的安全闸：只放行**字面量内网 IP**，不放行任何域名。
+//   ✅ 10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、127.0.0.0/8、IPv6 ULA/回环
+//   ❌ 一切域名（含 evil.internal / metadata.google.internal 这类`*.internal`）、
+//      169.254.0.0/16（云元数据 169.254.169.254 所在段）、100.64.0.0/10（CGNAT）、
+//      fe80::/10（IPv6 link-local）、公网 IP
+// 之所以连 169.254 / 100.64 也拒掉：它们并非真正的「内网」，
+// 而 169.254.169.254 是云厂商实例元数据服务，被用于跳转即是内网探测跳板。
+function isAllowedNavigateHost(host) {
   const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!h) return false;
-  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.lan') || h.endsWith('.internal')) return true;
-  // IPv4 私有段
+
+  // ① IPv4：仅字面量，且必须落在真正的私有/回环段
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (m) {
-    const [a, b] = [parseInt(m[1], 10), parseInt(m[2], 10)];
-    if (a === 10) return true;
-    if (a === 127) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 169 && b === 254) return true;              // link-local
-    if (a === 100 && b >= 64 && b <= 127) return true;    // CGNAT
-    return false;
+    const o = m.slice(1).map((x) => parseInt(x, 10));
+    if (o.some((n) => n > 255)) return false;             // 非法八位组
+    const [a, b] = o;
+    if (a === 10) return true;                            // 10.0.0.0/8
+    if (a === 127) return true;                           // 回环
+    if (a === 192 && b === 168) return true;              // 192.168.0.0/16
+    if (a === 172 && b >= 16 && b <= 31) return true;     // 172.16.0.0/12
+    return false;   // 含 169.254/16（元数据）、100.64/10（CGNAT）、公网
   }
-  // IPv6：ULA(fc00::/7) / link-local(fe80::/10) / 回环
+
+  // ② IPv6：仅字面量，且仅 ULA(fc00::/7) / 回环(::1)
   if (h.includes(':')) {
-    if (h === '::1' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe8') ||
-        h.startsWith('fe9') || h.startsWith('fea') || h.startsWith('feb')) return true;
-    return false;
+    if (h === '::1') return true;
+    if (/^f[cd][0-9a-f]{2}:/.test(h)) return true;        // fc00::/7 → fc/fd 开头
+    return false;   // fe80::/10 等一律拒绝
   }
-  return false;   // 其余视为公网域名
+
+  // ③ 其余一律视为域名/主机名 → 拒绝（本闸只允许字面 IP）
+  return false;
 }
 
 /* ---- 网关根路径 <-> 目标 base 的双向映射 ---- */
@@ -931,23 +962,36 @@ app.get(BASE + '/api/me', (req, res) => {
   });
 });
 
-/* --- 导航模式：无有效 Token 的访客，输入地址后只做 URL 跳转（不代理）--- */
+/* --- 未通过校验的访客：输入地址后只做 URL 跳转（不代理）--- */
 app.post(BASE + '/api/navigate', async (req, res) => {
   if (!NAVIGATE_ENABLED) return res.status(404).json({ ok: false, error: '导航模式未启用' });
   // 已通过 Token 的会话应走真实代理，不应来这里
   const s = getSession(req);
   if (s && s.authed) return res.status(409).json({ ok: false, error: '当前会话已鉴权，请直接使用代理' });
 
+  // 限流（在解析/校验之前，防止无成本刷日志或探测）
+  const rl = navigateRateLimit(req);
+  if (rl > 0) {
+    res.setHeader('Retry-After', String(Math.ceil(rl / 1000)));
+    return res.status(429).json({ ok: false, error: '请求过于频繁，请稍后重试' });
+  }
+
   const raw = String((req.body && req.body.target) || '').trim();
   const target = normalizeTarget(raw);
   if (!target) return res.status(400).json({ ok: false, error: '地址格式不正确，示例：192.168.1.10:8080' });
 
-  // 安全闸：默认只允许跳内网/私有地址（防开放重定向被当钓鱼跳板）
-  if (!NAVIGATE_ALLOW_PUBLIC && !isPrivateHost(target.host)) {
-    return res.status(403).json({
-      ok: false,
-      error: '出于安全考虑，导航仅允许内网地址（10./172.16-31./192.168./127. 等）',
-    });
+  // 安全闸（默认开）：只允许「字面量内网 IP + 显式端口」，不放行任何域名
+  if (!NAVIGATE_ALLOW_PUBLIC) {
+    if (!isAllowedNavigateHost(target.host)) {
+      return res.status(403).json({
+        ok: false,
+        error: '仅支持内网 IP 地址（10. / 172.16-31. / 192.168. / 127. 等），且需带端口',
+      });
+    }
+    // 必须显式写出端口（按需求「只有 内网IP:端口」；也避免误跳默认端口）
+    if (!/:\d{1,5}(?:[/?#]|$)/.test(raw)) {
+      return res.status(400).json({ ok: false, error: '请带上端口，例如 192.168.1.10:8080' });
+    }
   }
 
   const url = targetOrigin(target) + (target.base || '');

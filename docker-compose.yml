@@ -39,10 +39,13 @@ services:
       COOKIE_SECURE: "${COOKIE_SECURE:-auto}"
       # 未通过校验的访客也可进入界面，输入地址后由浏览器直接跳转（界面无任何提示）
       NAVIGATE_ENABLED: "${NAVIGATE_ENABLED:-true}"
-      # 是否允许跳公网地址（默认 false＝仅内网，防开放重定向钓鱼）
+      # 是否允许跳任意地址（默认 false＝只允许字面内网 IP+端口，域名全拒）
       NAVIGATE_ALLOW_PUBLIC: "${NAVIGATE_ALLOW_PUBLIC:-false}"
-      # 是否记录每次跳转（时间/来源 IP/目标 URL/UA）
+      # 是否记录每次跳转（仅记放行的请求；时间/来源 IP/目标 URL/UA）
       NAVIGATE_LOG: "${NAVIGATE_LOG:-true}"
+      # 未鉴权访客的跳转限流（每 IP，窗口内最大次数）
+      NAVIGATE_RATE_MAX: "${NAVIGATE_RATE_MAX:-10}"
+      NAVIGATE_RATE_WINDOW_MS: "${NAVIGATE_RATE_WINDOW_MS:-60000}"
       # 排查用：打印「实际转发路径 + 上游状态码」，并给响应加 X-Gate-* 诊断头
       PROXY_LOG: "${PROXY_LOG:-false}"
       # 目标做防盗链/Host 校验而返回 403 时保持默认；设为 "false" 可 A/B 对比
