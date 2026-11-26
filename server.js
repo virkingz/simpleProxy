@@ -1682,19 +1682,48 @@ function injectExitButton(html, target, opts = {}) {
   //   · 用 MutationObserver 监听，一旦被移除就重新挂上；
   //   · 不依赖任何外部资源，纯内联，零改写原有内容。
   const j = (s) => JSON.stringify(String(s));   // 安全嵌入字符串
+  // 样式：默认左上角、收成小圆点（悬停/确认态才展开文字）、可拖动。
+  // 用运行时创建的 <style>（只追加、不改写原有内容），这样能用 :hover 伪类，
+  // 比内联样式更干净；且 SPA 重建 body 也不影响该 style。
+  const CSS =
+    '#__gate_exit__{position:fixed;top:10px;left:10px;z-index:2147483647;' +
+    'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
+    'touch-action:none;user-select:none;-webkit-user-select:none;}' +
+    '#__gate_exit_btn__{display:flex;align-items:center;gap:7px;box-sizing:border-box;' +
+    'width:28px;height:28px;padding:0;justify-content:center;border:0;border-radius:50%;' +
+    'background:#111827;color:#fff;font-size:12px;line-height:1;cursor:pointer;' +
+    'box-shadow:0 4px 14px rgba(0,0,0,.28);opacity:.92;overflow:hidden;' +
+    'transition:width .18s ease,padding .18s ease,background .15s ease;}' +
+    '#__gate_exit__:hover #__gate_exit_btn__{width:auto;padding:0 12px 0 10px;' +
+    'border-radius:999px;justify-content:flex-start;}' +
+    '#__gate_exit__.__g_armed #__gate_exit_btn__{width:auto;padding:0 12px 0 10px;' +
+    'border-radius:999px;justify-content:flex-start;background:#b42318;}' +
+    '#__gate_exit__ .__g_dot{width:8px;height:8px;border-radius:50%;background:#22c55e;' +
+    'flex:0 0 auto;display:inline-block;}' +
+    '#__gate_exit__.__g_armed .__g_dot{background:#fff;}' +
+    '#__gate_exit__ .__g_txt{max-width:0;opacity:0;overflow:hidden;white-space:nowrap;' +
+    'transition:max-width .2s ease,opacity .2s ease;}' +
+    '#__gate_exit__:hover .__g_txt,#__gate_exit__.__g_armed .__g_txt{max-width:340px;opacity:1;}';
   const script =
     '<script data-gate-exit="1">(function(){' +
     'if(window.__gate_exit_installed__)return;window.__gate_exit_installed__=true;' +
     'var LABEL=' + j(modeTag + ' ' + label) + ';' +
+    'var ACT="退出",ARM="再点一次确认退出";' +
+    'var POS=null;' +              // 会话内位置（拖动后记住，刷新即回默认；不做持久化）
+    'function ensureCss(){' +
+    'if(document.getElementById("__gate_exit_style__"))return;' +
+    'var s=document.createElement("style");s.id="__gate_exit_style__";' +
+    's.textContent=' + j(CSS) + ';' +
+    '(document.head||document.documentElement).appendChild(s);}' +
     'function build(){' +
     'var d=document.createElement("div");d.id="__gate_exit__";' +
-    'd.setAttribute("style","position:fixed;right:18px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;");' +
-    'd.innerHTML=' + j('<button id="__gate_exit_btn__" style="display:flex;align-items:center;gap:8px;padding:9px 14px;border:0;border-radius:999px;background:#111827;color:#fff;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:.92;"><span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block;"></span><span></span><span style="opacity:.5">|</span><span style="text-decoration:underline">退出</span></button>') + ';' +
-    'var b=d.querySelector("button");var t=b.querySelectorAll("span")[1];if(t)t.textContent=LABEL;' +
-    // 阻止被代理页面（SPA/React）抢走点击事件。
-    // 必须用**冒泡阶段**（第 3 参数 false）：这样按钮自身的处理器先执行，
-    // 事件再从按钮冒泡到容器时被拦下、不外泄给宿主页面。
-    // 若用捕获阶段（true）会在按钮处理器**之前**就 stopPropagation，反而把自己的点击吃掉。
+    'if(POS){d.style.left=POS[0]+"px";d.style.top=POS[1]+"px";}' +
+    'd.innerHTML=' + j('<button id="__gate_exit_btn__"><span class="__g_dot"></span><span class="__g_txt"></span></button>') + ';' +
+    'var b=d.querySelector("button"),t=d.querySelector(".__g_txt");' +
+    't.textContent=LABEL+" | "+ACT;' +
+    // 阻止被代理页面（SPA/React）抢走事件。必须用**冒泡阶段**（第 3 参数 false）：
+    // 事件先到按钮自身的处理器，再冒泡到容器被拦下、不外泄给宿主页面。
+    // 若用捕获阶段（true）会在按钮处理器**之前**就 stopPropagation，反而吃掉自己的点击。
     '["mousedown","mouseup","click","pointerdown","pointerup","touchstart","touchend"].forEach(function(ev){' +
     'd.addEventListener(ev,function(e){e.stopPropagation();},false);});' +
     // 清「目标」留在这个源下的所有痕迹：
@@ -1737,18 +1766,50 @@ function injectExitButton(html, target, opts = {}) {
     'try{return wipe();}catch(e){return null;}' +
     '}).then(once,once);' +
     '}' +
-    // 两步确认：不使用浏览器 confirm()（可能被「阻止此页面创建更多对话框」静默拦掉，
-    // 导致点击毫无反应）。改为按钮自身二次确认，纯 DOM，不依赖任何弹窗。
+    'var armTimer=null;' +
+    'function disarm(){if(d.getAttribute("data-armed")==="1"){d.setAttribute("data-armed","0");' +
+    'd.className="";t.textContent=LABEL+" | "+ACT;}}' +
+    // ---- 拖动：Pointer Events + setPointerCapture，鼠标/触摸通用 ----
+    // 阈值 4px：小于阈值算点击（避免手抖误判为拖动）；拖动后吞掉随后的 click，
+    // 并取消「待确认」态 —— 否则「拖完再点」会误退出。
+    'var drag=false,mv=false,sx=0,sy=0,ox=0,oy=0,suppress=false,TH=4;' +
+    'd.addEventListener("pointerdown",function(e){' +
+    'if(e.button&&e.button!==0)return;' +
+    'drag=true;mv=false;sx=e.clientX;sy=e.clientY;' +
+    'var r=d.getBoundingClientRect();ox=r.left;oy=r.top;' +
+    'try{d.setPointerCapture(e.pointerId);}catch(_){}});' +
+    'd.addEventListener("pointermove",function(e){' +
+    'if(!drag)return;' +
+    'var dx=e.clientX-sx,dy=e.clientY-sy;' +
+    'if(!mv&&Math.abs(dx)<=TH&&Math.abs(dy)<=TH)return;' +
+    'mv=true;' +
+    'var vw=document.documentElement.clientWidth||window.innerWidth||1024;' +
+    'var vh=document.documentElement.clientHeight||window.innerHeight||768;' +
+    'var nw=d.offsetWidth||28,nh=d.offsetHeight||28;' +
+    'var nx=Math.max(0,Math.min(ox+dx,vw-nw));' +
+    'var ny=Math.max(0,Math.min(oy+dy,vh-nh));' +
+    'd.style.left=nx+"px";d.style.top=ny+"px";' +
+    'd.style.right="auto";d.style.bottom="auto";' +
+    'POS=[nx,ny];});' +
+    'd.addEventListener("pointerup",function(e){' +
+    'if(!drag)return;drag=false;' +
+    'try{d.releasePointerCapture(e.pointerId);}catch(_){}' +
+    'if(mv){suppress=true;disarm();}});' +
+    'd.addEventListener("pointercancel",function(){drag=false;});' +
+    // ---- 两步确认：不使用浏览器 confirm()（可能被「阻止此页面创建更多对话框」
+    // 静默拦掉导致点击毫无反应）。改为按钮自身二次确认，纯 DOM，不依赖弹窗。 ----
     'b.addEventListener("click",function(e){' +
     'e.preventDefault();e.stopPropagation();' +
-    'if(b.getAttribute("data-armed")==="1"){doExit();return;}' +
-    'b.setAttribute("data-armed","1");b.style.background="#b42318";' +
-    'if(t)t.textContent="再点一次确认退出";' +
-    'setTimeout(function(){if(b.getAttribute("data-armed")==="1"){b.setAttribute("data-armed","0");b.style.background="#111827";if(t)t.textContent=LABEL;}},4000);' +
+    'if(suppress){suppress=false;return;}' +
+    'if(d.getAttribute("data-armed")==="1"){doExit();return;}' +
+    'd.setAttribute("data-armed","1");d.className="__g_armed";t.textContent=ARM;' +
+    'if(armTimer)clearTimeout(armTimer);' +
+    'armTimer=setTimeout(disarm,4000);' +
     '});' +
     'return d;}' +
     'function mount(){' +
     'if(!document.body){return setTimeout(mount,30);}' +
+    'ensureCss();' +
     'if(document.getElementById("__gate_exit__"))return;' +
     'var host=document.documentElement||document.body;' +
     'host.appendChild(build());}' +
