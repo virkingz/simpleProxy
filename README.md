@@ -2,8 +2,12 @@
 
 [![Build and Push Docker Image](https://github.com/virkingz/simpleProxy/actions/workflows/docker.yml/badge.svg)](https://github.com/virkingz/simpleProxy/actions/workflows/docker.yml)
 
-带 **Token 门禁**的网页版内网代理网关。通过浏览器访问网关，用 Token 进入后输入「内网 IP:端口」登录，
-之后**该会话的所有请求都会被代理到目标地址**；保存过的地址显示在右侧，可一键登录；退出后回到登录页。
+网页版**导航面板**，同时具备「代理」与「导航」两种形态：
+
+- **代理模式**（持有 Token）：输入「内网 IP:端口」，网关把该会话的所有请求**原样代理**到目标地址；
+  保存过的地址显示在右侧，可一键登录；退出后回到登录页。
+- **导航模式**（无 / 错 Token）：同样能进入界面、输入地址，但**不做代理**，而是让浏览器**直接跳转**到该地址；
+  跳转记录（时间 / 来源 IP / 目标 URL / UA）写入服务端日志。默认只允许跳转**内网 / 私有地址**，避免被当作开放重定向的钓鱼跳板。
 
 ![登录页](docs/login.png)
 
@@ -11,7 +15,8 @@
 
 ## 功能
 
-- **透明代理（唯一模式）**：nginx 风格，**内容一字不改**原样转发 —— 不改写 HTML/JS/CSS、不加参数、不打乱 Cookie，兼容性最好
+- **双模式**：持有 Token → **透明代理**（网关代你访问）；无 Token → **导航跳转**（浏览器直接跳转，并记录 URL）
+- **透明代理**：nginx 风格，**内容一字不改**原样转发 —— 不改写 HTML/JS/CSS、不加参数、不打乱 Cookie，兼容性最好
 - **Token 门禁**：必须先输入正确 Token 才能进入网关页面，会话保持 12 小时
 - **目标登录**：输入 `内网IP:端口`（支持 `http://` / `https://`，省略协议默认 http）
 - **Cookie 原样透传**：目标自己的会话 Cookie 完整送达，登录状态不会丢
@@ -154,6 +159,9 @@ GATE_PORT=8080                   # 宿主机映射端口
 | `HSTS_MAX_AGE` | `15552000` | HSTS 有效期（秒，默认 180 天）。仅在 HTTPS 请求下下发；设 `0` 关闭 |
 | `TRUST_PROXY` | `false` | 网关前有 CDN/反代时设为 `true`，才会采信 `X-Forwarded-For` / `X-Forwarded-Proto`（影响限速取 IP 与 `Secure` 判定、HSTS）。直连内网时保持 `false`，否则这些头可被伪造 |
 | `COOKIE_SECURE` | `auto` | 会话 Cookie 的 `Secure` 策略。`auto`＝仅 HTTPS 请求加；`true`＝恒加。**仅当你的部署只通过 HTTPS 访问时**才设 `true`；若同时保留 HTTP 直连入口（如 `192.168.x.x:端口`），设 `true` 会导致浏览器拒收 Cookie、HTTP 下无法登录 |
+| `NAVIGATE_ENABLED` | `true` | 是否启用**导航模式**（无 Token 也能进页面、输入地址后由浏览器直接跳转）。设 `false` 则恢复「无 Token 一律挡在门外」 |
+| `NAVIGATE_ALLOW_PUBLIC` | `false` | 导航模式是否允许跳转到**公网**地址。默认 `false`＝仅内网/私有地址（`10./172.16-31./192.168./127.` 等），避免网关被当作开放重定向的钓鱼跳板。**除非你明确需要，否则不要打开** |
+| `NAVIGATE_LOG` | `true` | 是否把每次导航跳转记入服务端日志（含时间、来源 IP、目标 URL、User-Agent） |
 | `STRIP_CLIENT_HEADERS` | `true` | 转发给目标时清洗 `X-Forwarded-*` 并把 `Referer`/`Origin` 伪装成目标自身（仅页面/接口请求；静态资源会还原浏览器原生的 `Sec-Fetch-*` 且不注入 `Origin`）。目标做防盗链/Host 校验返回 403 时保持默认即可；设为 `false` 可 A/B 对比 |
 | `PROXY_LOG` | `false` | 设为 `true` 时打印每个代理请求的**实际转发路径**与上游状态码（`docker logs -f simpleproxy`），并在响应里加 `X-Gate-Outgoing` / `X-Gate-Upstream` 头，DevTools 里可直接看出 404 来自哪一层、路径被改成了什么 |
 | `CACHE_CONTROL` | `private, no-store, max-age=0, must-revalidate` | 所有网关响应（含代理透传）强制使用的缓存头。前面套 CDN 时**必须禁止共享缓存**，否则 404 会被缓存固化。可放宽为 `private, max-age=600`（仍禁 CDN 共享缓存） |
@@ -181,7 +189,28 @@ GATE_PORT=8080                   # 宿主机映射端口
 - 本工具会代理内网服务，**请勿直接暴露在公网**；如需外网访问，建议置于反向代理 + HTTPS + IP 白名单之后
 - 未设置 `TOKEN` 时使用默认值 `changeme`，启动会打印告警，请务必修改
 
-### Token 防爆破
+### 导航模式（无 Token 的访客）
+
+没有 Token 的人**也能进入同一个界面**，但走的是「导航」而非「代理」：
+
+| | 代理模式（有 Token） | 导航模式（无 / 错 Token） |
+| --- | --- | --- |
+| 能否进页面 | ✅ | ✅ |
+| 输入地址后 | 网关**原样代理**，返回目标内容 | 浏览器**直接 302 跳转**到该地址 |
+| 网关是否接触内容 | 是 | **否**（只下发一个跳转地址） |
+| 地址限制 | 任意 | 默认**仅内网 / 私有地址** |
+| 是否记录日志 | — | ✅ 记录时间 / 来源 IP / 目标 URL / UA |
+
+**为什么默认限制内网地址？** 导航模式允许访客自填跳转目标，若不限制，任何人都能用你的公网域名
+构造 `https://你的网关/?...→ 钓鱼站` 的链接，把你的网关当成**开放重定向**跳板。
+因此默认只放行 `10./172.16-31./192.168./127.`、`.local/.lan/.internal` 等私有地址；
+确有需要时设 `NAVIGATE_ALLOW_PUBLIC=true` 放开（自行承担风险）。
+若完全不需要导航模式，设 `NAVIGATE_ENABLED=false` 即恢复「无 Token 一律挡在门外」。
+
+> 安全提醒：导航模式**只做跳转、不代理**，因此它不会让无 Token 者访问到任何内网内容 ——
+> 前提是被跳转的服务自己也在内网可达。如果该服务本身暴露在公网，那与网关无关。
+
+
 
 Token 是唯一凭证，因此对**在线爆破**做了防爆破设计（简单、诚实、可审计）：
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>内网网关</title>
+<title>导航面板</title>
 <style>
   :root{
     --bg:#f4f6fb; --panel:#ffffff; --line:#e6e9f0; --line2:#eef1f7;
@@ -41,6 +41,12 @@
   }
   .btn:hover{background:var(--brand-d)}
   .btn:disabled{opacity:.55;cursor:not-allowed}
+  .btn.ghost{background:#eef2ff;color:#3b5bdb}
+  .btn.ghost:hover{background:#dfe7ff}
+  .modebar{display:none;font-size:12.5px;line-height:1.55;padding:10px 12px;border-radius:9px;margin-bottom:14px}
+  .modebar.show{display:block}
+  .modebar.nav{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412}
+  .modebar.proxy{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}
   .row{display:flex;align-items:center;gap:9px;margin-bottom:16px;font-size:13px;color:var(--txt2);cursor:pointer;user-select:none}
   .row input{width:16px;height:16px;accent-color:var(--brand);cursor:pointer}
   .err{background:#fef2f2;border:1px solid #fecaca;color:#b42318;font-size:12.5px;padding:9px 11px;border-radius:9px;margin-bottom:14px;display:none;line-height:1.5}
@@ -90,19 +96,20 @@
 <div class="wrap" id="v-token">
   <div class="card">
     <div class="brand">
-      <div class="logo">G</div>
+      <div class="logo">N</div>
       <div>
-        <h1>内网网关</h1>
-        <p>Intranet Gateway</p>
+        <h1>导航面板</h1>
+        <p>Navigation Panel</p>
       </div>
     </div>
     <div class="err" id="e-token"></div>
     <div class="field">
       <label>访问令牌 Token</label>
       <input type="password" id="token" placeholder="请输入访问令牌" autocomplete="off" spellcheck="false">
-      <div class="hint">需持有正确的 Token 才能进入网关页面。</div>
+      <div class="hint">持有 Token 可进入<b>代理模式</b>（网关代你访问目标）；<br>没有 Token 也可以进入<b>导航模式</b>，点击后由浏览器直接跳转到目标地址。</div>
     </div>
     <button class="btn" id="btn-token">进入</button>
+    <button class="btn ghost" id="btn-nav" style="margin-top:10px">跳过 Token，仅导航（直接跳转）</button>
     <div class="foot">会话保持 12 小时 · 请勿在公共设备保存</div>
   </div>
 </div>
@@ -113,12 +120,13 @@
     <div class="grid">
       <div class="card" style="max-width:none">
         <div class="brand">
-          <div class="logo">G</div>
+          <div class="logo">N</div>
           <div>
-            <h1>登录内网服务</h1>
-            <p>输入 内网 IP : 端口，登录后所有请求原样代理到该地址</p>
+            <h1>导航面板</h1>
+            <p id="sub-login">输入 内网 IP : 端口，登录后所有请求原样代理到该地址</p>
           </div>
         </div>
+        <div class="modebar" id="modebar"></div>
         <div class="err" id="e-login"></div>
         <div class="field">
           <label>目标地址</label>
@@ -139,7 +147,7 @@
           <div class="hint">备注会显示在右侧列表，方便区分多个相似地址。</div>
         </div>
         <button class="btn" id="btn-login">登录并代理</button>
-        <div class="foot">登录后页面底部会显示悬浮「退出」按钮，随时返回本页</div>
+        <div class="foot" id="foot-login">登录后页面底部会显示悬浮「退出」按钮，随时返回本页</div>
       </div>
 
       <div class="card side" style="max-width:none;align-self:start">
@@ -153,6 +161,7 @@
 <script>
 const API = '/_gate/api';
 const $ = (id) => document.getElementById(id);
+let MODE = 'token';   // token | nav | proxy
 
 function show(view){
   $('v-token').classList.toggle('hidden', view !== 'token');
@@ -178,10 +187,32 @@ async function api(path, opts = {}){
 /* ---------- 初始化：判断当前状态 ---------- */
 (async function init(){
   const { data } = await api('/me');
-  if (data.authed) { show('login'); loadSites(); }
+  if (data.authed) { setMode('proxy'); show('login'); loadSites(); }
   else show('token');
   $('token').focus();
 })();
+
+/* ---------- 模式切换：代理（有 Token）/ 导航（无 Token，仅跳转） ---------- */
+function setMode(m){
+  MODE = m;
+  const nav = (m === 'nav');
+  const bar = $('modebar');
+  bar.className = 'modebar show ' + (nav ? 'nav' : 'proxy');
+  bar.innerHTML = nav
+    ? '导航模式：未通过 Token 校验。输入地址后<b>由浏览器直接跳转</b>到该地址（网关不代理、不接触内容）。'
+    : '代理模式：已通过 Token 校验。输入地址后<b>由网关原样代理</b>，内容一字不改。';
+  $('sub-login').textContent = nav
+    ? '输入 内网 IP : 端口，点击后浏览器直接跳转到该地址'
+    : '输入 内网 IP : 端口，登录后所有请求原样代理到该地址';
+  $('btn-login').textContent = nav ? '跳转到该地址' : '登录并代理';
+  $('foot-login').textContent = nav
+    ? '仅发起跳转，不经过网关转发；跳转记录会记入服务端日志。'
+    : '登录后页面底部会显示悬浮「退出」按钮，随时返回本页';
+  // 导航模式下隐藏「保存」相关（保存列表需要鉴权）
+  $('save').closest('label').classList.toggle('hidden', nav);
+  if (nav) { $('name-wrap').classList.add('hidden'); $('note-wrap').classList.add('hidden'); }
+  $('save').checked = false;
+}
 
 /* ---------- Token 校验 ---------- */
 async function submitToken(){
@@ -192,11 +223,12 @@ async function submitToken(){
   err('e-token', '');
   const { status, data } = await api('/auth', { method: 'POST', body: { token } });
   btn.disabled = false; btn.textContent = '进入';
-  if (status === 200 && data.ok) { show('login'); loadSites(); $('target').focus(); }
+  if (status === 200 && data.ok) { setMode('proxy'); show('login'); loadSites(); $('target').focus(); }
   else err('e-token', data.error || 'Token 校验失败');
 }
 $('btn-token').onclick = submitToken;
 $('token').addEventListener('keydown', e => { if (e.key === 'Enter') submitToken(); });
+$('btn-nav').onclick = () => { setMode('nav'); show('login'); $('target').focus(); };
 
 /* ---------- 保存勾选：同时展开「名称」与「备注」 ---------- */
 $('save').addEventListener('change', e => {
@@ -210,8 +242,17 @@ $('save').addEventListener('change', e => {
 async function login(target, save, name, note){
   const btn = $('btn-login');
   const auto = arguments.length === 1; // 来自右侧一键登录
-  if (!auto) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>连接中'; }
+  const nav = (MODE === 'nav');
+  if (!auto) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>' + (nav ? '跳转中' : '连接中'); }
   err('e-login', '');
+  if (nav) {
+    // 导航模式：拿后端校验+记录后的跳转地址，再由浏览器直接跳走
+    const { status, data } = await api('/navigate', { method: 'POST', body: { target } });
+    if (!auto) { btn.disabled = false; btn.textContent = '跳转到该地址'; }
+    if (status === 200 && data.ok && data.url) { location.href = data.url; }
+    else err('e-login', data.error || '跳转失败');
+    return;
+  }
   const { status, data } = await api('/login', {
     method: 'POST',
     body: { target, save: !!save, name: name || '', note: note || '' },
@@ -224,6 +265,7 @@ async function login(target, save, name, note){
 $('btn-login').onclick = () => {
   const t = $('target').value.trim();
   if (!t) return err('e-login', '请输入目标地址，例如 192.168.1.10:8080');
+  if (MODE === 'nav') return login(t);
   const save = $('save').checked;
   login(t, save, save ? $('name').value.trim() : '', save ? $('note').value.trim() : '');
 };

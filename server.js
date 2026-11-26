@@ -19,6 +19,12 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const TOKEN = process.env.TOKEN || 'changeme';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const INJECT_EXIT = process.env.INJECT_EXIT_BUTTON !== 'false';
+// 「导航模式」（无 Token 访客）：持正确 Token → 透明代理；无/错 Token → 只做 URL 跳转。
+// 跳转目标由访客自己填写，因此有「开放重定向」风险。默认**只允许内网/私有地址**，
+// 避免本网关被当作公网钓鱼跳板。设 NAVIGATE_ALLOW_PUBLIC=true 可放开为任意地址。
+const NAVIGATE_ENABLED = process.env.NAVIGATE_ENABLED !== 'false';
+const NAVIGATE_ALLOW_PUBLIC = process.env.NAVIGATE_ALLOW_PUBLIC === 'true';
+const NAVIGATE_LOG = process.env.NAVIGATE_LOG !== 'false';
 // 退出代理时是否「重置目标登录态」：
 // 透明代理下浏览器认为所有内容都来自网关这个源，被代理页面自己下发的登录
 // Cookie / localStorage 也记在网关域下。若不清，下次代理同一服务会带着旧
@@ -352,6 +358,33 @@ function normalizeTarget(input) {
 function targetOrigin(t) {
   const isDefault = (t.protocol === 'http' && t.port === 80) || (t.protocol === 'https' && t.port === 443);
   return `${t.protocol}://${t.host}${isDefault ? '' : ':' + t.port}`;
+}
+
+// 判断主机是否为「内网 / 私有 / 本机」地址。
+// 用于「导航模式」的安全闸：默认只允许跳到这类地址，避免网关被当作公网钓鱼跳板。
+function isPrivateHost(host) {
+  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return false;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.lan') || h.endsWith('.internal')) return true;
+  // IPv4 私有段
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (m) {
+    const [a, b] = [parseInt(m[1], 10), parseInt(m[2], 10)];
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 169 && b === 254) return true;              // link-local
+    if (a === 100 && b >= 64 && b <= 127) return true;    // CGNAT
+    return false;
+  }
+  // IPv6：ULA(fc00::/7) / link-local(fe80::/10) / 回环
+  if (h.includes(':')) {
+    if (h === '::1' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe8') ||
+        h.startsWith('fe9') || h.startsWith('fea') || h.startsWith('feb')) return true;
+    return false;
+  }
+  return false;   // 其余视为公网域名
 }
 
 /* ---- 网关根路径 <-> 目标 base 的双向映射 ---- */
@@ -892,9 +925,37 @@ app.get(BASE + '/api/me', (req, res) => {
     ok: true,
     build: BUILD_ID,
     authed: !!(s && s.authed),
+    navigate: NAVIGATE_ENABLED,
     hasTarget: !!(s && s.target),
     target: s && s.target ? { protocol: s.target.protocol, host: s.target.host, port: s.target.port, base: s.target.base } : null,
   });
+});
+
+/* --- 导航模式：无有效 Token 的访客，输入地址后只做 URL 跳转（不代理）--- */
+app.post(BASE + '/api/navigate', async (req, res) => {
+  if (!NAVIGATE_ENABLED) return res.status(404).json({ ok: false, error: '导航模式未启用' });
+  // 已通过 Token 的会话应走真实代理，不应来这里
+  const s = getSession(req);
+  if (s && s.authed) return res.status(409).json({ ok: false, error: '当前会话已鉴权，请直接使用代理' });
+
+  const raw = String((req.body && req.body.target) || '').trim();
+  const target = normalizeTarget(raw);
+  if (!target) return res.status(400).json({ ok: false, error: '地址格式不正确，示例：192.168.1.10:8080' });
+
+  // 安全闸：默认只允许跳内网/私有地址（防开放重定向被当钓鱼跳板）
+  if (!NAVIGATE_ALLOW_PUBLIC && !isPrivateHost(target.host)) {
+    return res.status(403).json({
+      ok: false,
+      error: '出于安全考虑，导航仅允许内网地址（10./172.16-31./192.168./127. 等）',
+    });
+  }
+
+  const url = targetOrigin(target) + (target.base || '');
+  const ip = clientIp(req);
+  if (NAVIGATE_LOG) {
+    console.log(`[navigate] ${new Date().toISOString()} ip=${ip} -> ${url} (ua=${String(req.headers['user-agent'] || '-').slice(0, 80)})`);
+  }
+  res.json({ ok: true, url });
 });
 
 /* --- 登录目标（仅透明代理）--- */
