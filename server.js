@@ -1390,6 +1390,10 @@ app.post(BASE + '/api/logout', (req, res) => {
     s.target = null;
   }
   if (cleared.length) res.setHeader('Set-Cookie', cleared);
+  // Clear-Site-Data 是最可靠的「清源」方式：让浏览器丢掉该源的
+  // Service Worker 注册与 Cache Storage（PWA 缓存），以及各存储。
+  // 注意：**不含 cookies** —— 网关自身与目标的会话 Cookie 由 Set-Cookie 精确处理。
+  res.setHeader('Clear-Site-Data', '"cache", "storage"');
   res.json({ ok: true, clearedCookies: cleared.length });
 });
 
@@ -1687,17 +1691,61 @@ function injectExitButton(html, target, opts = {}) {
     'd.setAttribute("style","position:fixed;right:18px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;");' +
     'd.innerHTML=' + j('<button id="__gate_exit_btn__" style="display:flex;align-items:center;gap:8px;padding:9px 14px;border:0;border-radius:999px;background:#111827;color:#fff;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:.92;"><span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block;"></span><span></span><span style="opacity:.5">|</span><span style="text-decoration:underline">退出</span></button>') + ';' +
     'var b=d.querySelector("button");var t=b.querySelectorAll("span")[1];if(t)t.textContent=LABEL;' +
-    // 退出：先让服务端过期目标的登录 Cookie（含 HttpOnly），再清同源的
-    // localStorage/sessionStorage/IndexedDB（覆盖 token 存前端的服务），
-    // 最后回登录页 —— 这样下次代理同一服务会像第一次一样要求登录。
-    'b.addEventListener("click",function(){if(!confirm("退出代理并返回登录页？"))return;' +
+    // 阻止被代理页面（SPA/React）抢走点击事件。
+    // 必须用**冒泡阶段**（第 3 参数 false）：这样按钮自身的处理器先执行，
+    // 事件再从按钮冒泡到容器时被拦下、不外泄给宿主页面。
+    // 若用捕获阶段（true）会在按钮处理器**之前**就 stopPropagation，反而把自己的点击吃掉。
+    '["mousedown","mouseup","click","pointerdown","pointerup","touchstart","touchend"].forEach(function(ev){' +
+    'd.addEventListener(ev,function(e){e.stopPropagation();},false);});' +
+    // 清「目标」留在这个源下的所有痕迹：
+    //  · Service Worker：PWA（如 IT-Tools）会注册 SW 并缓存整站；必须**先注销**，
+    //    否则退出后跳转 / 会被 SW 用缓存的旧页面顶回来，看着像「没退出」。
+    //  · Cache Storage：清掉 SW 的预缓存，使其无法再命中缓存 → 自动回源到网关。
+    //  · localStorage/sessionStorage/IndexedDB：覆盖把 token 存前端的服务。
+    // 返回 Promise：调用方等它完成后再跳转（关键：不能边清边跳）。
     'function wipe(){' +
+    'var jobs=[];' +
+    'try{if(navigator.serviceWorker&&navigator.serviceWorker.getRegistrations){' +
+    'jobs.push(navigator.serviceWorker.getRegistrations().then(function(rs){' +
+    'return Promise.all((rs||[]).map(function(r){return r.unregister().catch(function(){});}));' +
+    '}).catch(function(){}));}}catch(e){}' +
+    'try{if(window.caches&&caches.keys){' +
+    'jobs.push(caches.keys().then(function(ks){' +
+    'return Promise.all((ks||[]).map(function(k){return caches.delete(k).catch(function(){});}));' +
+    '}).catch(function(){}));}}catch(e){}' +
     'try{localStorage.clear();}catch(e){}' +
     'try{sessionStorage.clear();}catch(e){}' +
-    'try{if(indexedDB&&indexedDB.databases){indexedDB.databases().then(function(dbs){(dbs||[]).forEach(function(db){try{indexedDB.deleteDatabase(db.name);}catch(e){}});});}}catch(e){}' +
+    'try{if(indexedDB&&indexedDB.databases){' +
+    'jobs.push(indexedDB.databases().then(function(dbs){' +
+    '(dbs||[]).forEach(function(db){try{indexedDB.deleteDatabase(db.name);}catch(e){}});' +
+    '}).catch(function(){}));}}catch(e){}' +
+    'return Promise.all(jobs);' +
     '}' +
-    'fetch("/_gate/api/logout",{method:"POST"}).then(function(){wipe();location.href="/";})' +
-    '.catch(function(){wipe();location.href="/";});});' +
+    'function leave(){' +
+    // replace 而非 href：不留历史记录，避免「后退」又被 SW 缓存顶回代理页
+    'location.replace("/?_gate_exit=" + Date.now());' +
+    '}' +
+    'function doExit(){' +
+    // 关键顺序：先让服务端过期目标 Cookie，再清 SW/缓存/存储，**最后**才跳转；
+    // 且全程带超时兜底，任何一步卡住都不会让用户点不动。
+    'var done=false;function once(){if(done)return;done=true;leave();}' +
+    'setTimeout(once,2500);' +
+    'var p;' +
+    'try{p=fetch("/_gate/api/logout",{method:"POST",cache:"no-store",credentials:"same-origin"});}' +
+    'catch(e){p=Promise.resolve();}' +
+    'Promise.resolve(p).catch(function(){}).then(function(){' +
+    'try{return wipe();}catch(e){return null;}' +
+    '}).then(once,once);' +
+    '}' +
+    // 两步确认：不使用浏览器 confirm()（可能被「阻止此页面创建更多对话框」静默拦掉，
+    // 导致点击毫无反应）。改为按钮自身二次确认，纯 DOM，不依赖任何弹窗。
+    'b.addEventListener("click",function(e){' +
+    'e.preventDefault();e.stopPropagation();' +
+    'if(b.getAttribute("data-armed")==="1"){doExit();return;}' +
+    'b.setAttribute("data-armed","1");b.style.background="#b42318";' +
+    'if(t)t.textContent="再点一次确认退出";' +
+    'setTimeout(function(){if(b.getAttribute("data-armed")==="1"){b.setAttribute("data-armed","0");b.style.background="#111827";if(t)t.textContent=LABEL;}},4000);' +
+    '});' +
     'return d;}' +
     'function mount(){' +
     'if(!document.body){return setTimeout(mount,30);}' +
