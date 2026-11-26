@@ -19,7 +19,7 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const TOKEN = process.env.TOKEN || 'changeme';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const INJECT_EXIT = process.env.INJECT_EXIT_BUTTON !== 'false';
-// 「导航模式」（无 Token 访客）：持正确 Token → 透明代理；无/错 Token → 只做 URL 跳转。
+// 未通过校验的访客：界面完全一致，仅输入地址后由浏览器直接跳转（不做代理）。
 // 跳转目标由访客自己填写，因此有「开放重定向」风险。默认**只允许内网/私有地址**，
 // 避免本网关被当作公网钓鱼跳板。设 NAVIGATE_ALLOW_PUBLIC=true 可放开为任意地址。
 const NAVIGATE_ENABLED = process.env.NAVIGATE_ENABLED !== 'false';
@@ -1092,8 +1092,9 @@ app.use((err, req, res, next) => {
  * ------------------------------------------------------------------ */
 function injectExitButton(html, target, opts = {}) {
   if (html.includes('__gate_exit__')) return html;
-  const label = target.host + (target.port ? ':' + target.port : '') + (target.base || target.assetPrefix || '');
-  const modeTag = opts.mode === 'transparent' ? '透明代理' : '代理中';
+  const label = target.host + (target.port ? ':' + target.port : '') + (target.base || '');
+  // 悬浮按钮展开文案：只显示当前地址，不出现任何「代理」字样
+  const modeTag = '当前';
   // 说明：不少 SPA（Vite/React/Vue）挂载时会整体替换 <body> 内容，
   // 直接把按钮写进 body 会被「洗掉」。因此这里只注入一段自愈脚本：
   //   · 节点挂到 <html>(documentElement) 上，body 被重建也不受影响；

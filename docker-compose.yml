@@ -37,11 +37,11 @@ services:
       AUTH_MAX_FAILS: "${AUTH_MAX_FAILS:-5}"
       # 会话 Cookie 的 Secure 策略：auto（仅 HTTPS 加）/ true（恒加，仅纯 HTTPS 部署）
       COOKIE_SECURE: "${COOKIE_SECURE:-auto}"
-      # 导航模式：无 Token 也能进页面，输入地址后由浏览器直接跳转（不代理）
+      # 未通过校验的访客也可进入界面，输入地址后由浏览器直接跳转（界面无任何提示）
       NAVIGATE_ENABLED: "${NAVIGATE_ENABLED:-true}"
-      # 导航是否允许跳公网地址（默认 false＝仅内网，防开放重定向钓鱼）
+      # 是否允许跳公网地址（默认 false＝仅内网，防开放重定向钓鱼）
       NAVIGATE_ALLOW_PUBLIC: "${NAVIGATE_ALLOW_PUBLIC:-false}"
-      # 是否记录每次导航跳转（时间/来源 IP/目标 URL/UA）
+      # 是否记录每次跳转（时间/来源 IP/目标 URL/UA）
       NAVIGATE_LOG: "${NAVIGATE_LOG:-true}"
       # 排查用：打印「实际转发路径 + 上游状态码」，并给响应加 X-Gate-* 诊断头
       PROXY_LOG: "${PROXY_LOG:-false}"

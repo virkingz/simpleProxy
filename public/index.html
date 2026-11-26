@@ -41,12 +41,7 @@
   }
   .btn:hover{background:var(--brand-d)}
   .btn:disabled{opacity:.55;cursor:not-allowed}
-  .btn.ghost{background:#eef2ff;color:#3b5bdb}
-  .btn.ghost:hover{background:#dfe7ff}
-  .modebar{display:none;font-size:12.5px;line-height:1.55;padding:10px 12px;border-radius:9px;margin-bottom:14px}
-  .modebar.show{display:block}
-  .modebar.nav{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412}
-  .modebar.proxy{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}
+
   .row{display:flex;align-items:center;gap:9px;margin-bottom:16px;font-size:13px;color:var(--txt2);cursor:pointer;user-select:none}
   .row input{width:16px;height:16px;accent-color:var(--brand);cursor:pointer}
   .err{background:#fef2f2;border:1px solid #fecaca;color:#b42318;font-size:12.5px;padding:9px 11px;border-radius:9px;margin-bottom:14px;display:none;line-height:1.5}
@@ -104,12 +99,10 @@
     </div>
     <div class="err" id="e-token"></div>
     <div class="field">
-      <label>访问令牌 Token</label>
+      <label>访问令牌</label>
       <input type="password" id="token" placeholder="请输入访问令牌" autocomplete="off" spellcheck="false">
-      <div class="hint">持有 Token 可进入<b>代理模式</b>（网关代你访问目标）；<br>没有 Token 也可以进入<b>导航模式</b>，点击后由浏览器直接跳转到目标地址。</div>
     </div>
     <button class="btn" id="btn-token">进入</button>
-    <button class="btn ghost" id="btn-nav" style="margin-top:10px">跳过 Token，仅导航（直接跳转）</button>
     <div class="foot">会话保持 12 小时 · 请勿在公共设备保存</div>
   </div>
 </div>
@@ -123,17 +116,16 @@
           <div class="logo">G</div>
           <div>
             <h1>内网网关</h1>
-            <p id="sub-login">输入 内网 IP : 端口，登录后所有请求原样代理到该地址</p>
+            <p id="sub-login">输入 内网 IP : 端口</p>
           </div>
         </div>
-        <div class="modebar" id="modebar"></div>
         <div class="err" id="e-login"></div>
         <div class="field">
           <label>目标地址</label>
           <input type="text" id="target" placeholder="192.168.1.10:8080" autocomplete="off" spellcheck="false">
-          <div class="hint">支持 http / https，省略协议默认 http；自签 https 证书自动忽略校验。<br>默认使用<b>透明代理</b>：内容一字不改、原样转发，兼容性最好。</div>
+          <div class="hint">支持 http / https，省略协议默认 http；自签 https 证书自动忽略校验。</div>
         </div>
-        <label class="row" style="margin-bottom:12px">
+        <label class="row" id="save-row" style="margin-bottom:12px">
           <input type="checkbox" id="save">
           <span>保存此地址，便于下次一键登录</span>
         </label>
@@ -146,7 +138,7 @@
           <input type="text" id="note" placeholder="用于识别，例如：王掌的机器 / 生产环境" autocomplete="off">
           <div class="hint">备注会显示在右侧列表，方便区分多个相似地址。</div>
         </div>
-        <button class="btn" id="btn-login">登录并代理</button>
+        <button class="btn" id="btn-login">进入</button>
         <div class="foot" id="foot-login">登录后页面底部会显示悬浮「退出」按钮，随时返回本页</div>
       </div>
 
@@ -192,43 +184,44 @@ async function api(path, opts = {}){
   $('token').focus();
 })();
 
-/* ---------- 模式切换：代理（有 Token）/ 导航（无 Token，仅跳转） ---------- */
+/* ---------- 内部工作模式（对界面完全无感，不向用户暴露任何区别） ---------- */
+// 'proxy'：已通过校验，请求由网关转发
+// 'nav'  ：未通过校验，点击后由浏览器直接跳转到目标地址
 function setMode(m){
   MODE = m;
-  const nav = (m === 'nav');
-  const bar = $('modebar');
-  bar.className = 'modebar show ' + (nav ? 'nav' : 'proxy');
-  bar.innerHTML = nav
-    ? '导航模式：未通过 Token 校验。输入地址后<b>由浏览器直接跳转</b>到该地址（网关不代理、不接触内容）。'
-    : '代理模式：已通过 Token 校验。输入地址后<b>由网关原样代理</b>，内容一字不改。';
-  $('sub-login').textContent = nav
-    ? '输入 内网 IP : 端口，点击后浏览器直接跳转到该地址'
-    : '输入 内网 IP : 端口，登录后所有请求原样代理到该地址';
-  $('btn-login').textContent = nav ? '跳转到该地址' : '登录并代理';
-  $('foot-login').textContent = nav
-    ? '仅发起跳转，不经过网关转发；跳转记录会记入服务端日志。'
-    : '登录后页面底部会显示悬浮「退出」按钮，随时返回本页';
-  // 导航模式下隐藏「保存」相关（保存列表需要鉴权）
-  $('save').closest('label').classList.toggle('hidden', nav);
-  if (nav) { $('name-wrap').classList.add('hidden'); $('note-wrap').classList.add('hidden'); }
+  // 界面两态保持一致：不出现任何「代理 / 导航 / 模式」字样，也不隐藏任何控件
+  $('sub-login').textContent = '输入 内网 IP : 端口';
+  $('btn-login').textContent = '进入';
+  $('foot-login').textContent = '登录后页面底部会显示悬浮「退出」按钮，随时返回本页';
   $('save').checked = false;
+  $('name-wrap').classList.add('hidden');
+  $('note-wrap').classList.add('hidden');
 }
 
-/* ---------- Token 校验 ---------- */
+/* ---------- 校验并进入 ---------- */
+// 关键：无论校验结果如何，都**一律进入同一界面**，不显示任何错误或差异，
+// 攻击者无法从界面/提示判断令牌是否正确。
 async function submitToken(){
   const btn = $('btn-token');
   const token = $('token').value;
-  if (!token) return err('e-token', '请输入 Token');
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>校验中';
+  if (!token) return err('e-token', '请输入访问令牌');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>进入中';
   err('e-token', '');
   const { status, data } = await api('/auth', { method: 'POST', body: { token } });
   btn.disabled = false; btn.textContent = '进入';
-  if (status === 200 && data.ok) { setMode('proxy'); show('login'); loadSites(); $('target').focus(); }
-  else err('e-token', data.error || 'Token 校验失败');
+  const authed = (status === 200 && data.ok);
+  if (authed) {
+    setMode('proxy');
+  } else {
+    // 校验未通过：静默进入「仅跳转」形态（界面与已鉴权完全一致，无任何提示）
+    setMode('nav');
+  }
+  show('login');
+  loadSites();     // 两态都渲染侧栏，保持界面一致
+  $('target').focus();
 }
 $('btn-token').onclick = submitToken;
 $('token').addEventListener('keydown', e => { if (e.key === 'Enter') submitToken(); });
-$('btn-nav').onclick = () => { setMode('nav'); show('login'); $('target').focus(); };
 
 /* ---------- 保存勾选：同时展开「名称」与「备注」 ---------- */
 $('save').addEventListener('change', e => {
@@ -238,34 +231,34 @@ $('save').addEventListener('change', e => {
 });
 
 /* ---------- 登录目标 ---------- */
-// 统一使用透明代理（nginx 风格零改写）：内容一字不改，兼容性最好。
+// 通过校验时由网关透明转发（内容一字不改）；未通过校验时仅跳转。
 async function login(target, save, name, note){
   const btn = $('btn-login');
   const auto = arguments.length === 1; // 来自右侧一键登录
   const nav = (MODE === 'nav');
-  if (!auto) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>' + (nav ? '跳转中' : '连接中'); }
+  if (!auto) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>进入中'; }
   err('e-login', '');
   if (nav) {
-    // 导航模式：拿后端校验+记录后的跳转地址，再由浏览器直接跳走
+    // 未通过校验：仅向服务端索取跳转地址（并留痕），再由浏览器直接跳过去
     const { status, data } = await api('/navigate', { method: 'POST', body: { target } });
-    if (!auto) { btn.disabled = false; btn.textContent = '跳转到该地址'; }
+    if (!auto) { btn.disabled = false; btn.textContent = '进入'; }
     if (status === 200 && data.ok && data.url) { location.href = data.url; }
-    else err('e-login', data.error || '跳转失败');
+    else err('e-login', '无法访问该地址，请检查后重试');
     return;
   }
   const { status, data } = await api('/login', {
     method: 'POST',
     body: { target, save: !!save, name: name || '', note: note || '' },
   });
-  if (!auto) { btn.disabled = false; btn.textContent = '登录并代理'; }
+  if (!auto) { btn.disabled = false; btn.textContent = '进入'; }
   if (status === 200 && data.ok) {
     location.href = '/';
-  } else err('e-login', data.error || '登录失败');
+  } else err('e-login', data.error || '无法访问该地址，请检查后重试');
 };
 $('btn-login').onclick = () => {
   const t = $('target').value.trim();
   if (!t) return err('e-login', '请输入目标地址，例如 192.168.1.10:8080');
-  if (MODE === 'nav') return login(t);
+  if (MODE === 'nav') return login(t);   // 未通过校验：仅跳转
   const save = $('save').checked;
   login(t, save, save ? $('name').value.trim() : '', save ? $('note').value.trim() : '');
 };
@@ -281,8 +274,7 @@ function esc(v){ return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&l
 
 async function loadSites(){
   const { status, data } = await api('/sites');
-  if (status === 401) { show('token'); return; }
-  const sites = data.sites || [];
+  const sites = (status === 200 && Array.isArray(data.sites)) ? data.sites : [];
   $('cnt').textContent = sites.length;
   const box = $('slist');
   if (!sites.length) {
