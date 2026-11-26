@@ -32,6 +32,82 @@ const PROXY_LOG = process.env.PROXY_LOG === 'true';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 小时无操作过期
 const COOKIE_NAME = '_gate_sid';
 const BASE = '/_gate';
+
+/* ---- Token 防爆破（与「诱饵」模式协同）----
+ * 诱饵模式下，**绝不能**用 401/429 这类可区分状态来暴露“token 错了” ——
+ * 那等于直接告诉攻击者，诱饵也白做。因此这里改为「静默节流」：
+ *   某个 IP 在窗口内尝试过于频繁时，只是**把它拖慢**（人为延迟），
+ *   响应内容与形状仍与成功完全一致。
+ * 关闭诱饵（AUTH_DECOY=false）时，恢复为「失败 → 指数退避 + 429」。
+ */
+const AUTH_DECOY = process.env.AUTH_DECOY !== 'false';
+const AUTH_MAX_FAILS = parseInt(process.env.AUTH_MAX_FAILS || '5', 10);
+const AUTH_LOCK_BASE_MS = parseInt(process.env.AUTH_LOCK_BASE_MS || '1000', 10);
+const AUTH_FAIL_WINDOW_MS = parseInt(process.env.AUTH_FAIL_WINDOW_MS || String(15 * 60 * 1000), 10);
+// 静默节流：窗口内尝试次数超过该值后，每次登录延迟（毫秒），逐渐加长
+const AUTH_SILENT_DELAY_MS = parseInt(process.env.AUTH_SILENT_DELAY_MS || '400', 10);
+const AUTH_SILENT_MAX_DELAY_MS = parseInt(process.env.AUTH_SILENT_MAX_DELAY_MS || '4000', 10);
+// 计数：ip -> { fails, firstAt, lockedUntil }
+const authFails = new Map();
+function clientIp(req) {
+  // 网关前面可能有 CDN（EdgeOne）。仅在显式信任时才采信 X-Forwarded-For，
+  // 否则伪造该头即可绕过限速。设 TRUST_PROXY=true 时取最左侧地址。
+  if (process.env.TRUST_PROXY === 'true') {
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (xff) return xff;
+  }
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+function authRec(ip) {
+  const now = Date.now();
+  let rec = authFails.get(ip);
+  if (!rec || now - rec.firstAt > AUTH_FAIL_WINDOW_MS) rec = { fails: 0, firstAt: now, lockedUntil: 0 };
+  return rec;
+}
+function authLockRemaining(req) {
+  const rec = authFails.get(clientIp(req));
+  if (!rec) return 0;
+  const left = rec.lockedUntil - Date.now();
+  return left > 0 ? left : 0;
+}
+// 静默节流：返回应等待的毫秒数（不暴露任何「你错了」的信号）
+function authThrottleDelay(req) {
+  const rec = authFails.get(clientIp(req));
+  if (!rec || rec.fails < AUTH_MAX_FAILS) return 0;
+  const over = rec.fails - AUTH_MAX_FAILS;
+  return Math.min(AUTH_SILENT_DELAY_MS * Math.pow(2, Math.min(over, 6)), AUTH_SILENT_MAX_DELAY_MS);
+}
+function authNoteFail(req) {
+  const ip = clientIp(req);
+  const rec = authRec(ip);
+  rec.fails++;
+  if (!AUTH_DECOY && rec.fails >= AUTH_MAX_FAILS) {
+    // 非诱饵模式：指数退避（第 N 次超出阈值 → base * 2^(超出次数)，上限 5 分钟）
+    const over = rec.fails - AUTH_MAX_FAILS;
+    rec.lockedUntil = Date.now() + Math.min(AUTH_LOCK_BASE_MS * Math.pow(2, over), 5 * 60 * 1000);
+  }
+  authFails.set(ip, rec);
+}
+// 诱饵模式专用：记录**每一次尝试**（不论对错），且不因成功而复位。
+// 目的是让节流只反映「请求频率」，与 token 是否正确无关 → 杜绝时序/计数侧信道。
+function authNoteAttempt(req) {
+  const ip = clientIp(req);
+  const rec = authRec(ip);
+  rec.fails++;
+  authFails.set(ip, rec);
+}
+function authNoteSuccess(req) { authFails.delete(clientIp(req)); }
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of authFails) {
+    if (now - rec.firstAt > AUTH_FAIL_WINDOW_MS && now > rec.lockedUntil) authFails.delete(ip);
+  }
+}, 60 * 1000).unref?.();
+
+// 是否启用安全响应头（可关，便于 A/B 排查被代理站点异常）
+const SECURITY_HEADERS = process.env.SECURITY_HEADERS !== 'false';
+// HSTS 仅在有把握全程 HTTPS 时生效（默认开）。内网 HTTP 直连访问不受影响 —— HSTS 只由浏览器在 HTTPS 响应后记录。
+const HSTS_MAX_AGE = parseInt(process.env.HSTS_MAX_AGE || '15552000', 10); // 180 天
 // 构建标识：优先用环境变量（CI 可注入 commit sha），否则用「自身代码内容」的哈希。
 // 用内容哈希的好处：同一次发布内保持不变（不影响浏览器缓存），
 // 一旦代码更新就自动变化 → 参与静态资源缓存破坏参数，
@@ -215,9 +291,10 @@ function getSession(req, res, create = false) {
   let s = sid && sessions.get(sid);
   if (!s && create) {
     sid = crypto.randomUUID().replace(/-/g, '');
-    s = { sid, authed: false, target: null, tgtCookies: [], createdAt: Date.now(), lastSeen: Date.now() };
+    s = { sid, authed: false, decoy: false, target: null, tgtCookies: [], createdAt: Date.now(), lastSeen: Date.now() };
     sessions.set(sid, s);
-    res.setHeader('Set-Cookie', `${COOKIE_NAME}=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200`);
+    // HTTPS 时带 Secure；HTTP 直连不带（否则浏览器拒收）
+    res.setHeader('Set-Cookie', sessionCookie(req, sid, 43200));
   }
   if (s) s.lastSeen = Date.now();
   return s || null;
@@ -851,6 +928,7 @@ function cookiePrefix(t) {
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
   stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
+  stripGateHeaders(res);    // 移除网关自身的安全头，避免污染被代理内容（见函数注释）
   // 记下「浏览器看到的路径」：Cookie 的默认 Path 要按它推导，
   // 而不是按补了 base 前缀后发往上游的路径（否则过期指令的 Path 会不匹配）。
   req.__gate_visible_path = req.url;
@@ -1008,6 +1086,8 @@ function pfResolve(req) {
   const sid = readSid(req);
   const s = sid && sessions.get(sid);
   if (s) s.lastSeen = Date.now();
+  // 诱饵会话不具备任何真实代理能力（返回 null → 上层按「无有效会话」处理）
+  if (s && s.decoy) return null;
   return s;
 }
 
@@ -1032,6 +1112,7 @@ function pfHandleHttp(req, res, port) {
   req.url = req.url || '/';
   req.__pf_port = port;                   // 标记：响应侧直通，不做任何改写
   req.__gate_session = s;                 // 供响应侧记录目标 Cookie 台账
+  stripGateHeaders(res);                  // 移除网关自身安全头，避免污染被代理内容
   const t = s.target;
   proxy.web(req, res, {
     target: targetOrigin(t),
@@ -1162,10 +1243,13 @@ function ledgerAdd(session, setCookieValues, reqPath) {
 }
 
 // 生成「清空目标登录态」的一组 Set-Cookie 头（每个记录的 name+path 各一条）
-function targetClearCookies(session) {
+// 注意：删除 Cookie 需要与「原 Cookie 的属性」匹配，因此 HTTPS 下也要带 Secure，
+// 否则浏览器可能拒绝这条过期指令、导致旧登录态残留。
+function targetClearCookies(session, req) {
   if (!session || !Array.isArray(session.tgtCookies)) return [];
+  const secure = req && isHttpsReq(req) ? '; Secure' : '';
   return session.tgtCookies.map((c) =>
-    `${c.name}=; Path=${c.path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`
+    `${c.name}=; Path=${c.path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax${secure}`
   );
 }
 function rewriteTargetAbsoluteLocation(loc, target) {
@@ -1301,16 +1385,112 @@ app.use((req, res, next) => {
 
 app.use(BASE + '/api', express.json({ limit: '64kb' }));
 
+/* --- 安全响应头（只作用于「网关自身」的响应）---
+ * 注意：**绝不**加到被代理的内容上 —— 那会破坏透明代理「零改写」承诺，
+ * 且 X-Frame-Options / CSP 可能让被代理应用无法按自身需要内嵌或被内嵌。
+ * 这里挂在最前面的中间件上；代理响应走 res.writeHead 时不会继承这些头
+ * （因为它们只在 next() 前设置到 res 上，而 writeHead 会以传入对象为准覆盖）。
+ * 为稳妥起见，代理写出点用的是显式 headers 对象，天然不带这些头。
+ */
+app.use((req, res, next) => {
+  if (SECURITY_HEADERS) {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'same-origin');
+    // 防点击劫持：Token 输入框在首屏，必须禁止被 iframe 嵌套
+    res.setHeader('X-Frame-Options', 'DENY');
+    // 仅在 HTTPS 场景下发给浏览器才有效；HTTP 访问时浏览器会忽略
+    if (HSTS_MAX_AGE > 0 && isHttpsReq(req)) {
+      res.setHeader('Strict-Transport-Security', `max-age=${HSTS_MAX_AGE}; includeSubDomains`);
+    }
+    // 登录页含内联 <script>/<style>，因此保留 'unsafe-inline'；
+    // 其余一律收紧到自身来源，杜绝外链注入与 base 劫持。
+    res.setHeader('Content-Security-Policy',
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+      "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; " +
+      "frame-ancestors 'none'; form-action 'self'");
+  }
+  next();
+});
+
+// 判断当前请求是否经 HTTPS（网关前面可能有 CDN/TLS 终止）
+function isHttpsReq(req) {
+  if (req.socket && req.socket.encrypted) return true;
+  if (process.env.TRUST_PROXY === 'true') {
+    const xf = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+    if (xf) return xf === 'https';
+  }
+  return false;
+}
+
+// 这些是「网关自身」才该带的安全头。
+// ⚠️ Node 的 res.setHeader 会**合并**进后续 res.writeHead()，所以代理响应会
+// 意外继承它们 —— 那会破坏透明代理「零改写」，且 CSP/X-Frame-Options 可能
+// 让被代理应用无法正常工作。因此在进入代理前必须显式移除。
+const GATE_HEADER_NAMES = [
+  'X-Content-Type-Options', 'Referrer-Policy', 'X-Frame-Options',
+  'Strict-Transport-Security', 'Content-Security-Policy',
+];
+function stripGateHeaders(res) {
+  for (const h of GATE_HEADER_NAMES) {
+    try { res.removeHeader(h); } catch {}
+  }
+}
+
+// 组装会话 Cookie：HTTPS 时附加 Secure（防协议降级被明文携带），
+// HTTP 直连（内网 192.168.x.x）时不加，否则浏览器拒收该 Cookie。
+function sessionCookie(req, sid, maxAge) {
+  return `${COOKIE_NAME}=${sid}; Path=/; HttpOnly; SameSite=Lax` +
+    (isHttpsReq(req) ? '; Secure' : '') +
+    `; Max-Age=${maxAge}`;
+}
+
 app.use(BASE + '/static', express.static(path.join(__dirname, 'public'), { index: false }));
 
-/* --- Token 校验 --- */
-app.post(BASE + '/api/auth', (req, res) => {
-  const s = getSession(req, res, true);
+/* --- Token 校验（含防爆破 / 诱饵）---
+ * 诱饵模式（AUTH_DECOY，默认开）：
+ *   任何 token 都返回**完全一致**的响应 —— 状态码、body、Cookie 全同（恒定时间）。
+ *   正确的 token → 正常会话；错误的 token → 会话带 decoy 标记，
+ *   此后所有「真实代理」动作都被静默拒绝（见 doProxy / pfResolve / /api/login）。
+ *   目的：让在线爆破无法通过响应差异判断 token 对错，从而无法收敛。
+ * 关闭诱饵时：错误 token 返回 401，且失败达阈值后指数退避。
+ */
+app.post(BASE + '/api/auth', async (req, res) => {
+  // 非诱饵模式：退避期内直接 429
+  if (!AUTH_DECOY) {
+    const left = authLockRemaining(req);
+    if (left > 0) {
+      res.setHeader('Retry-After', String(Math.ceil(left / 1000)));
+      return res.status(429).json({ ok: false, error: `尝试过于频繁，请 ${Math.ceil(left / 1000)} 秒后重试` });
+    }
+  }
   const token = String((req.body && req.body.token) || '');
   const sha = (v) => crypto.createHash('sha256').update(v).digest();
-  const ok = crypto.timingSafeEqual(sha(token), sha(TOKEN));
-  if (!ok) return res.status(401).json({ ok: false, error: 'Token 不正确' });
+  const ok = crypto.timingSafeEqual(sha(token), sha(TOKEN));   // 恒定时间比较
+
+  // ⚠️ 顺序与「计数语义」都很关键：
+  //  · 先算延迟再记账 —— 否则前一次的正确/错误会影响本次延迟，形成时序预言机。
+  //  · 诱饵模式下**统计每一次尝试**（不论对错）、且成功后**不复位**计数 ——
+  //    否则攻击者可「先猜 G、再送一个错误 W；若 W 变快 ⇒ G 是对的」反推正确 token。
+  //    这样节流状态只取决于「请求频率」，与 token 是否正确**完全无关**。
+  const delay = AUTH_DECOY ? authThrottleDelay(req) : 0;
+  if (AUTH_DECOY) {
+    authNoteAttempt(req);
+  } else if (!ok) {
+    authNoteFail(req);
+  } else {
+    authNoteSuccess(req);
+  }
+  if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+
+  // 非诱饵模式：错误 token 仍返回 401（显式，便于管理员排查）
+  if (!AUTH_DECOY && !ok) {
+    return res.status(401).json({ ok: false, error: 'Token 不正确' });
+  }
+
+  // 到这里：成功 / 或诱饵。二者下发形状完全一致（Cookie 属性、body 均相同）。
+  const s = getSession(req, res, true);
   s.authed = true;
+  s.decoy = !ok;
   res.json({ ok: true });
 });
 
@@ -1342,6 +1522,20 @@ app.post(BASE + '/api/login', async (req, res) => {
   // 代理模式：transparent（nginx 风格、零改写，默认）/ path（路径代理 + 改写）
   const reqMode = String((req.body && req.body.mode) || 'transparent');
   target.mode = reqMode === 'path' ? 'path' : 'transparent';
+
+  // ⚠️ 诱饵会话：响应形状与真实会话**完全一致**（前端会照常跳转到目标地址），
+  // 但绝不写入 s.target —— 于是代理入口取不到目标，浏览器跳过去只会回到登录页。
+  // 同时**不写数据库**：否则爆破者能用保存列表反查/污染真实站点。
+  if (s.decoy) {
+    s.lastSeen = Date.now();
+    return res.json({
+      ok: true,
+      target: { protocol: target.protocol, host: target.host, port: target.port, base: target.base },
+      mode: target.mode,
+      pfPort: null,
+      pfHost: null,
+    });
+  }
 
   s.target = target;
   s.lastSeen = Date.now();
@@ -1385,7 +1579,7 @@ app.post(BASE + '/api/logout', (req, res) => {
   if (s) {
     pfRelease(s);
     // 清目标的登录 Cookie（不碰网关自身的 _gate_sid，保留 Token 门禁）
-    cleared = targetClearCookies(s);
+    cleared = targetClearCookies(s, req);
     s.tgtCookies = [];
     s.target = null;
   }
@@ -1405,10 +1599,10 @@ app.post(BASE + '/api/exit', (req, res) => {
   let cleared = [];
   if (s) {
     pfRelease(s);
-    cleared = targetClearCookies(s);
+    cleared = targetClearCookies(s, req);
   }
   if (sid) sessions.delete(sid);
-  const all = [...cleared, `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`];
+  const all = [...cleared, sessionCookie(req, '', 0)];
   res.setHeader('Set-Cookie', all);
   res.json({ ok: true, clearedCookies: cleared.length });
 });
@@ -1421,6 +1615,9 @@ app.post(BASE + '/api/exit', (req, res) => {
 app.get(BASE + '/api/diag', async (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
+  // 诱饵会话：该接口会按 query 里的地址去**探测内网**（相当于 SSRF 内置工具），
+  // 绝不能让爆破者用它扫内网。返回与真实「未设置目标」一致的中性错误。
+  if (s.decoy) return res.status(400).json({ ok: false, error: '未设置目标' });
   const t = (req.query.target && normalizeTarget(req.query.target)) || s.target;
   if (!t) return res.status(400).json({ ok: false, error: '未设置目标' });
 
@@ -1586,16 +1783,21 @@ app.get(BASE + '/api/diag', async (req, res) => {
   });
 });
 
-/* --- 站点列表 --- */
+/* --- 站点列表 ---
+ * ⚠️ 该列表是**全局共享**的（保存的内网 IP:端口）。诱饵会话必须看不到它，
+ * 否则爆破者一旦拿到诱饵会话，就能直接读走全部真实内网地址 —— 诱饵就白做了。
+ * 因此诱饵会话一律返回「空列表」（形状与真实一致，不泄露任何信息）。*/
 app.get(BASE + '/api/sites', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
+  if (s.decoy) return res.json({ ok: true, sites: [] });
   res.json({ ok: true, sites: stmt.list.all() });
 });
 
 app.delete(BASE + '/api/sites/:id', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
+  if (s.decoy) return res.json({ ok: true });   // 静默成功，不动真实数据
   stmt.del.run(parseInt(req.params.id, 10));
   res.json({ ok: true });
 });
@@ -1604,6 +1806,7 @@ app.delete(BASE + '/api/sites/:id', (req, res) => {
 app.patch(BASE + '/api/sites/:id', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
+  if (s.decoy) return res.json({ ok: true });   // 诱饵：静默成功，不触碰真实数据
   const id = parseInt(req.params.id, 10);
   const row = stmt.get.get(id);
   if (!row) return res.status(404).json({ ok: false, error: '记录不存在' });
@@ -1635,7 +1838,20 @@ app.use((req, res, next) => {
     // cacheControl:false 避免 Express 覆盖上面设置的 no-store
     return res.sendFile(indexPath, { cacheControl: false });
   }
-  res.status(404).send('Not found. 请先通过网关登录。');
+  res.status(404).type('text/plain; charset=utf-8').send('Not found. 请先通过网关登录。');
+});
+
+// 兜底 404：覆盖 /_gate/* 下未匹配的路由，避免落到 Express 默认错误页
+// （默认页会回 "Cannot GET /xxx"，暴露后端为 Node/Express）。
+app.use((req, res) => {
+  res.status(404).type('text/plain; charset=utf-8').send('Not found.');
+});
+
+// 兜底错误处理：不让 Express 默认错误页泄露堆栈/技术栈
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const code = err && err.status && err.status >= 400 ? err.status : 500;
+  res.status(code).type('text/plain; charset=utf-8').send(code === 400 ? 'Bad request.' : 'Server error.');
 });
 
 /* ------------------------------------------------------------------ *

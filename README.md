@@ -161,8 +161,17 @@ GATE_PORT=8080                   # 宿主机映射端口
 | `TOKEN` | `changeme` | **必改**。进入网关页所需的访问令牌 |
 | `PORT` | `8080` | 容器内监听端口 |
 | `DATA_DIR` | `/data`（镜像内） | SQLite 数据目录 |
-| `INJECT_EXIT_BUTTON` | `true` | 是否向被代理 HTML 注入右下角悬浮退出按钮 |
+| `INJECT_EXIT_BUTTON` | `true` | 是否向被代理 HTML 注入左上角悬浮退出按钮 |
 | `CLEAR_TARGET_COOKIES_ON_EXIT` | `true` | 退出代理时是否「重置目标登录态」。透明代理下被代理页面自己的登录 Cookie 也存在网关源下；开启后退出时会按台账逐个过期这些 Cookie（含 HttpOnly），并由前端清空同源 `localStorage/sessionStorage/IndexedDB`，使下次代理该服务**和第一次一样要重新登录**。设 `false` 保留登录态 |
+| `AUTH_DECOY` | `true` | **Token 校验诱饵**。开启后：任何（对或错）token 都返回**完全一致**的响应（状态码、body、Cookie 属性全同），让在线爆破无法通过响应差异判断对错。错误 token 会得到一个「诱饵会话」——界面照常、点击登录也照常跳转，但**永远不会真正代理**，也**看不到保存的地址列表**、**不能用诊断接口探测内网**。设 `false` 则恢复显式 401 + 失败锁定 |
+| `AUTH_MAX_FAILS` | `5` | 静默节流阈值：窗口内尝试超过该次数后，登录请求被**逐次拉长延迟**（不改变响应内容）。诱饵模式下计数与对错无关，避免时序侧信道 |
+| `AUTH_SILENT_DELAY_MS` | `400` | 静默节流的起始延迟（毫秒），随后指数增长 |
+| `AUTH_SILENT_MAX_DELAY_MS` | `4000` | 静默节流延迟上限（毫秒） |
+| `AUTH_LOCK_BASE_MS` | `1000` | **仅当 `AUTH_DECOY=false`**：失败后的指数退避基准时长（毫秒），上限 5 分钟 |
+| `AUTH_FAIL_WINDOW_MS` | `900000` | 失败/尝试计数窗口（毫秒，默认 15 分钟） |
+| `SECURITY_HEADERS` | `true` | 是否给**网关自身**页面下发安全响应头（`X-Frame-Options: DENY`、CSP、nosniff、Referrer-Policy、HSTS）。**不会加到被代理的内容上**，透明代理「零改写」不受影响 |
+| `HSTS_MAX_AGE` | `15552000` | HSTS 有效期（秒，默认 180 天）。仅在 HTTPS 请求下下发；设 `0` 关闭 |
+| `TRUST_PROXY` | `false` | 网关前有 CDN/反代时设为 `true`，才会采信 `X-Forwarded-For` / `X-Forwarded-Proto`（影响限速取 IP 与 `Secure` 判定、HSTS）。直连内网时保持 `false`，否则这些头可被伪造 |
 | `STRIP_CLIENT_HEADERS` | `true` | 转发给目标时清洗 `X-Forwarded-*` 并把 `Referer`/`Origin` 伪装成目标自身（仅页面/接口请求；静态资源会还原浏览器原生的 `Sec-Fetch-*` 且不注入 `Origin`）。目标做防盗链/Host 校验返回 403 时保持默认即可；设为 `false` 可 A/B 对比 |
 | `PROXY_LOG` | `false` | 设为 `true` 时打印每个代理请求的**实际转发路径**与上游状态码（`docker logs -f simpleproxy`），并在响应里加 `X-Gate-Outgoing` / `X-Gate-Upstream` 头，DevTools 里可直接看出 404 来自哪一层、路径被改成了什么 |
 | `AUTO_SUBPATH` | `true` | 静态资源在根路径被上游判 4xx 时，自动探测目标真实前缀并即时回源（探测同时尝试 gzip 协商与 http/https 两种协议）。设 `false` 关闭 |
@@ -192,6 +201,33 @@ GATE_PORT=8080                   # 宿主机映射端口
 - 会话 ID 为随机 UUID，存服务端内存，前端仅持 HttpOnly Cookie
 - 本工具会代理内网服务，**请勿直接暴露在公网**；如需外网访问，建议置于反向代理 + HTTPS + IP 白名单之后
 - 未设置 `TOKEN` 时使用默认值 `changeme`，启动会打印告警，请务必修改
+
+### Token 防爆破（诱饵机制）
+
+Token 是唯一凭证，因此对**在线爆破**做了专门设计（`AUTH_DECOY`，默认开）：
+
+- **响应不可区分**：无论 token 对错，`/_gate/api/auth` 都返回**完全一致**的状态码、body 与 Cookie 属性。
+  攻击者无法用「响应差异」判断是否猜中。
+- **诱饵会话**：错误 token 会得到一个**表面正常、实则无用**的会话 ——
+  界面照常进入、点击「登录并代理」也照常跳转，但：
+  - 永远不会真正建立代理（跳转后看到的是登录页，拿不到任何内网内容）；
+  - `GET /_gate/api/sites` 返回**空列表**（该列表全局共享，绝不能让爆破者读走内网地址）；
+  - `GET /_gate/api/diag`（内置的内网探测工具）不可用。
+- **静默节流**：高频尝试只会被**拉长响应时间**，不返回 401/429，
+  且计数**与 token 对错无关**（成功后也不复位）—— 避免「耗时差异 / 计数变化」形成预言机。
+
+> 注意：诱饵只是让爆破「不出声、不收敛」，**它不能降低爆破可行性**。
+> 真正的防线是 **Token 的熵值** —— 请使用足够长的随机串，例如 `openssl rand -hex 24`。
+> 一旦 token 被猜中，网关本身就是进入内网的跳板，诱饵对此无能为力。
+
+### 响应头与 Cookie
+
+- **网关自身**页面下发：`X-Frame-Options: DENY`（防点击劫持）、严格 CSP（`frame-ancestors 'none'`）、
+  `X-Content-Type-Options: nosniff`、`Referrer-Policy`，HTTPS 下额外下发 `Strict-Transport-Security`。
+  可用 `SECURITY_HEADERS=false` 关闭。
+- 这些头**不会加到被代理的内容上**（透明代理「零改写」不受影响）。
+- `_gate_sid` 始终带 `HttpOnly` + `SameSite=Lax`；**HTTPS 时**额外带 `Secure`
+  （内网 HTTP 直连不带，否则浏览器会拒收该 Cookie）。
 
 ## 常见问题
 

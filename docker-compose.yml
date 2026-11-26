@@ -30,6 +30,12 @@ services:
       # 退出代理时是否重置目标的登录态（过期其 Cookie + 清同源 JS 存储）。
       # 开启后，下次代理同一服务会像第一次一样要求登录。
       CLEAR_TARGET_COOKIES_ON_EXIT: "${CLEAR_TARGET_COOKIES_ON_EXIT:-true}"
+      # Token 校验诱饵：任何 token 都返回一致响应，错误 token 得到「诱饵会话」
+      # （界面照常但永不真正代理）。设 false 恢复显式 401 + 失败锁定。
+      AUTH_DECOY: "${AUTH_DECOY:-true}"
+      # 网关自身安全响应头（不上到被代理内容）。直连内网时保持 TRUST_PROXY=false。
+      SECURITY_HEADERS: "${SECURITY_HEADERS:-true}"
+      TRUST_PROXY: "${TRUST_PROXY:-false}"
       # 排查用：打印「实际转发路径 + 上游状态码」，并给响应加 X-Gate-* 诊断头
       PROXY_LOG: "${PROXY_LOG:-false}"
       # 通用子路径：静态资源在根路径被上游判 404 时自动探测真实前缀
