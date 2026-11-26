@@ -19,6 +19,12 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const TOKEN = process.env.TOKEN || 'changeme';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const INJECT_EXIT = process.env.INJECT_EXIT_BUTTON !== 'false';
+// 退出代理时是否「重置目标登录态」：
+// 透明代理下浏览器认为所有内容都来自网关这个源，被代理页面自己下发的登录
+// Cookie / localStorage 也记在网关域下。若不清，下次代理同一服务会带着旧
+// 登录态 → 跳过目标自己的登录页。开启后：退出时按台账逐个过期这些 Cookie
+// （含 HttpOnly），并清空该源的 localStorage/sessionStorage/IndexedDB。
+const CLEAR_TARGET_ON_EXIT = process.env.CLEAR_TARGET_COOKIES_ON_EXIT !== 'false';
 // 出站请求是否清洗「网关来源」头（默认开）。403 排查时可设为 false 做 A/B 对比。
 const STRIP_CLIENT_HEADERS = process.env.STRIP_CLIENT_HEADERS !== 'false';
 // 打印每个代理请求的上游状态，便于定位 4xx/5xx 来自哪一层
@@ -209,7 +215,7 @@ function getSession(req, res, create = false) {
   let s = sid && sessions.get(sid);
   if (!s && create) {
     sid = crypto.randomUUID().replace(/-/g, '');
-    s = { sid, authed: false, target: null, createdAt: Date.now(), lastSeen: Date.now() };
+    s = { sid, authed: false, target: null, tgtCookies: [], createdAt: Date.now(), lastSeen: Date.now() };
     sessions.set(sid, s);
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200`);
   }
@@ -845,6 +851,9 @@ function cookiePrefix(t) {
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
   stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
+  // 记下「浏览器看到的路径」：Cookie 的默认 Path 要按它推导，
+  // 而不是按补了 base 前缀后发往上游的路径（否则过期指令的 Path 会不匹配）。
+  req.__gate_visible_path = req.url;
   // 透明模式：不改写响应、不注入内容（仅追加退出按钮）。
   // 但用户显式填写的路径前缀（base）必须保留：否则 /lucky 这类部署会被丢掉，
   // 请求落到上游根路径，表现为「打开的是另一个页面 / 目标服务器默认页」。
@@ -1022,6 +1031,7 @@ function pfHandleHttp(req, res, port) {
   // 原样转发：不改写、不注入、不剥离任何东西
   req.url = req.url || '/';
   req.__pf_port = port;                   // 标记：响应侧直通，不做任何改写
+  req.__gate_session = s;                 // 供响应侧记录目标 Cookie 台账
   const t = s.target;
   proxy.web(req, res, {
     target: targetOrigin(t),
@@ -1076,6 +1086,8 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   // 防共享缓存：代理响应若被 CDN 按 URL 缓存，会导致切换目标串味 / 旧响应固化。
   // 只覆盖缓存头，其它头保持原样；另修正 Set-Cookie 的 Domain 与绝对 Location。
   const headers = fixPassthroughHeaders({ ...proxyRes.headers }, req.__gate_target);
+  // 记录目标下发的 Cookie（供退出时精确过期，含 HttpOnly）
+  ledgerAdd(req.__gate_session, headers['set-cookie'], req.__gate_visible_path || req.url);
   delete headers['cache-control'];
   delete headers['expires'];
   delete headers['pragma'];
@@ -1115,6 +1127,46 @@ function stripMetaCsp(html) {
  */
 function pfStripCookieDomain(v) {
   return String(v).replace(/;\s*Domain=[^;]*/gi, '');
+}
+
+/* ---- 目标登录态「台账」：记录目标下发过的 Cookie（名字 + Path）----
+ * 目的：退出代理时能精确把这些 Cookie 过期掉，让下次代理回到「未登录」。
+ * 为什么不靠前端删：登录 Cookie 多为 HttpOnly，JS 读不到也删不掉，必须服务端发。
+ * 为什么必须记 Path：删除 Cookie 要求 name+path 完全匹配，Path 猜不中就删不掉。 */
+function ledgerAdd(session, setCookieValues, reqPath) {
+  if (!session || !CLEAR_TARGET_ON_EXIT) return;
+  if (!Array.isArray(session.tgtCookies)) session.tgtCookies = [];
+  const list = Array.isArray(setCookieValues) ? setCookieValues : [setCookieValues];
+  for (const sc of list) {
+    const raw = String(sc || '');
+    const name = (/^\s*([^=;\s]+)\s*=/.exec(raw) || [])[1];
+    if (!name) continue;
+    // Path：显式声明优先；否则按浏览器默认规则，取请求路径的目录部分
+    let p = (/;\s*Path=([^;]*)/i.exec(raw) || [])[1];
+    if (p === undefined) {
+      const path = String(reqPath || '/').split('?')[0];
+      p = path.slice(0, path.lastIndexOf('/') + 1) || '/';
+    }
+    p = String(p).trim() || '/';
+    // 过期（Max-Age=0 / 过去时间）的 cookie 不必记
+    const expired = /;\s*Max-Age\s*=\s*0\b/i.test(raw) ||
+      (() => { const m = /;\s*Expires=([^;]+)/i.exec(raw); if (!m) return false; const t = Date.parse(m[1]); return !isNaN(t) && t <= Date.now(); })();
+    if (expired) {
+      session.tgtCookies = session.tgtCookies.filter((c) => !(c.name === name && c.path === p));
+      continue;
+    }
+    if (!session.tgtCookies.some((c) => c.name === name && c.path === p)) {
+      session.tgtCookies.push({ name, path: p });
+    }
+  }
+}
+
+// 生成「清空目标登录态」的一组 Set-Cookie 头（每个记录的 name+path 各一条）
+function targetClearCookies(session) {
+  if (!session || !Array.isArray(session.tgtCookies)) return [];
+  return session.tgtCookies.map((c) =>
+    `${c.name}=; Path=${c.path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`
+  );
 }
 function rewriteTargetAbsoluteLocation(loc, target) {
   try {
@@ -1187,6 +1239,8 @@ function decodeText(buf, contentType) {
 // 透明模式专用：只注入退出按钮，绝不改写其它内容
 function injectOnlyHtml(proxyRes, req, res, target) {
   const headers = fixPassthroughHeaders({ ...proxyRes.headers }, target);
+  // 记录目标下发的 Cookie（供退出时精确过期，含 HttpOnly）
+  ledgerAdd(req.__gate_session, headers['set-cookie'], req.__gate_visible_path || req.url);
   const enc = String(headers['content-encoding'] || '').toLowerCase();
   const ctype0 = String(headers['content-type'] || '');
   const isHtmlDoc = /text\/html/i.test(ctype0);
@@ -1320,11 +1374,23 @@ app.post(BASE + '/api/login', async (req, res) => {
   });
 });
 
-/* --- 退出当前代理（回登录页） --- */
+/* --- 退出当前代理（回登录页） ---
+ * 关键：透明代理下，被代理页面自己的登录 Cookie 也存在于「网关」这个源下。
+ * 若不清掉，下次代理同一服务会带着旧登录态 → 跳过目标自己的登录页。
+ * 这里按台账把目标下发过的 Cookie 逐个过期（含 HttpOnly，指名道姓 + 原 Path）。
+ * 前端脚本还会清 localStorage/sessionStorage/IndexedDB（覆盖非 Cookie 方案）。 */
 app.post(BASE + '/api/logout', (req, res) => {
   const s = getSession(req);
-  if (s) { pfRelease(s); s.target = null; }
-  res.json({ ok: true });
+  let cleared = [];
+  if (s) {
+    pfRelease(s);
+    // 清目标的登录 Cookie（不碰网关自身的 _gate_sid，保留 Token 门禁）
+    cleared = targetClearCookies(s);
+    s.tgtCookies = [];
+    s.target = null;
+  }
+  if (cleared.length) res.setHeader('Set-Cookie', cleared);
+  res.json({ ok: true, clearedCookies: cleared.length });
 });
 
 /* --- 完全退出（清 Token 会话） --- */
@@ -1332,10 +1398,15 @@ app.post(BASE + '/api/exit', (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
   const sid = cookies[COOKIE_NAME];
   const s = sid && sessions.get(sid);
-  if (s) pfRelease(s);
+  let cleared = [];
+  if (s) {
+    pfRelease(s);
+    cleared = targetClearCookies(s);
+  }
   if (sid) sessions.delete(sid);
-  res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
-  res.json({ ok: true });
+  const all = [...cleared, `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`];
+  res.setHeader('Set-Cookie', all);
+  res.json({ ok: true, clearedCookies: cleared.length });
 });
 
 /* --- 诊断：把上游真相一次打出来（需已通过 Token） ---
@@ -1552,7 +1623,10 @@ const indexPath = path.join(__dirname, 'public', 'index.html');
 app.use((req, res, next) => {
   if (req.path.startsWith(BASE + '/')) return next();
   const s = getSession(req);
-  if (s && s.target) return doProxy(req, res, s.target);
+  if (s && s.target) {
+    req.__gate_session = s;       // 供响应侧记录目标 Cookie 台账 / 退出时清理
+    return doProxy(req, res, s.target);
+  }
   if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) {
     // cacheControl:false 避免 Express 覆盖上面设置的 no-store
     return res.sendFile(indexPath, { cacheControl: false });
@@ -1613,8 +1687,17 @@ function injectExitButton(html, target, opts = {}) {
     'd.setAttribute("style","position:fixed;right:18px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;");' +
     'd.innerHTML=' + j('<button id="__gate_exit_btn__" style="display:flex;align-items:center;gap:8px;padding:9px 14px;border:0;border-radius:999px;background:#111827;color:#fff;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:.92;"><span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block;"></span><span></span><span style="opacity:.5">|</span><span style="text-decoration:underline">退出</span></button>') + ';' +
     'var b=d.querySelector("button");var t=b.querySelectorAll("span")[1];if(t)t.textContent=LABEL;' +
+    // 退出：先让服务端过期目标的登录 Cookie（含 HttpOnly），再清同源的
+    // localStorage/sessionStorage/IndexedDB（覆盖 token 存前端的服务），
+    // 最后回登录页 —— 这样下次代理同一服务会像第一次一样要求登录。
     'b.addEventListener("click",function(){if(!confirm("退出代理并返回登录页？"))return;' +
-    'fetch("/_gate/api/logout",{method:"POST"}).then(function(){location.href="/"}).catch(function(){location.href="/"});});' +
+    'function wipe(){' +
+    'try{localStorage.clear();}catch(e){}' +
+    'try{sessionStorage.clear();}catch(e){}' +
+    'try{if(indexedDB&&indexedDB.databases){indexedDB.databases().then(function(dbs){(dbs||[]).forEach(function(db){try{indexedDB.deleteDatabase(db.name);}catch(e){}});});}}catch(e){}' +
+    '}' +
+    'fetch("/_gate/api/logout",{method:"POST"}).then(function(){wipe();location.href="/";})' +
+    '.catch(function(){wipe();location.href="/";});});' +
     'return d;}' +
     'function mount(){' +
     'if(!document.body){return setTimeout(mount,30);}' +

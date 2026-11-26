@@ -27,6 +27,9 @@ services:
       DATA_DIR: "/data"
       # 是否在被代理页面右下角注入悬浮「退出」按钮
       INJECT_EXIT_BUTTON: "true"
+      # 退出代理时是否重置目标的登录态（过期其 Cookie + 清同源 JS 存储）。
+      # 开启后，下次代理同一服务会像第一次一样要求登录。
+      CLEAR_TARGET_COOKIES_ON_EXIT: "${CLEAR_TARGET_COOKIES_ON_EXIT:-true}"
       # 排查用：打印「实际转发路径 + 上游状态码」，并给响应加 X-Gate-* 诊断头
       PROXY_LOG: "${PROXY_LOG:-false}"
       # 通用子路径：静态资源在根路径被上游判 404 时自动探测真实前缀

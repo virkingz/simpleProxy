@@ -31,6 +31,20 @@ nginx 风格：**完全不碰响应体**。不注入、不重写 origin、不加
 
 Cookie 也**原样透传**（只剔除网关自身的会话 Cookie）：目标下发的会话 Cookie 会完整回到浏览器并在后续请求中原样送达，因此目标的登录状态不会丢——不会出现「登录后提示登录已过期」。
 
+### 退出即重置目标登录态
+
+透明代理下浏览器认为所有内容都来自**网关这个源**，因此被代理页面自己的登录 Cookie 也记在网关源下。
+若不清，下次代理同一服务会带着旧登录态、跳过目标自己的登录页。
+
+「退出」时会做两件事（`CLEAR_TARGET_COOKIES_ON_EXIT=false` 可关闭）：
+
+1. **服务端按台账精确过期登录 Cookie**：网关在转发时记录目标下发过的每个 `Set-Cookie` 的**名字 + Path**，退出时逐个下发 `Max-Age=0` 过期指令。这样即使 Cookie 是 `HttpOnly`（JS 读不到也删不掉）也能清除。
+2. **前端清空同源 JS 存储**：`localStorage` / `sessionStorage` / `IndexedDB`（覆盖用前端存储 token 的服务）。
+
+效果：退出后再代理该服务，**和第一次一样需要重新登录**。网关自身的 Token 门禁会话不受影响，下次打开网关无需重输 Token。
+
+> 说明：删除 Cookie 必须 `名字 + Path` 精确匹配，因此台账记录的是目标**实际使用**的 Path（如 `/api` 而非笼统的 `/`），这是能真正删掉的关键。
+
 ### 关于 https 与混合内容
 
 网关与目标之间**按目标自身 scheme 建连**（http ↔ https 可跨协议，自签证书已内置忽略），对外协议跟随网关本身，
@@ -144,6 +158,7 @@ GATE_PORT=8080                   # 宿主机映射端口
 | `PORT` | `8080` | 容器内监听端口 |
 | `DATA_DIR` | `/data`（镜像内） | SQLite 数据目录 |
 | `INJECT_EXIT_BUTTON` | `true` | 是否向被代理 HTML 注入右下角悬浮退出按钮 |
+| `CLEAR_TARGET_COOKIES_ON_EXIT` | `true` | 退出代理时是否「重置目标登录态」。透明代理下被代理页面自己的登录 Cookie 也存在网关源下；开启后退出时会按台账逐个过期这些 Cookie（含 HttpOnly），并由前端清空同源 `localStorage/sessionStorage/IndexedDB`，使下次代理该服务**和第一次一样要重新登录**。设 `false` 保留登录态 |
 | `STRIP_CLIENT_HEADERS` | `true` | 转发给目标时清洗 `X-Forwarded-*` 并把 `Referer`/`Origin` 伪装成目标自身（仅页面/接口请求；静态资源会还原浏览器原生的 `Sec-Fetch-*` 且不注入 `Origin`）。目标做防盗链/Host 校验返回 403 时保持默认即可；设为 `false` 可 A/B 对比 |
 | `PROXY_LOG` | `false` | 设为 `true` 时打印每个代理请求的**实际转发路径**与上游状态码（`docker logs -f simpleproxy`），并在响应里加 `X-Gate-Outgoing` / `X-Gate-Upstream` 头，DevTools 里可直接看出 404 来自哪一层、路径被改成了什么 |
 | `AUTO_SUBPATH` | `true` | 静态资源在根路径被上游判 4xx 时，自动探测目标真实前缀并即时回源（探测同时尝试 gzip 协商与 http/https 两种协议）。设 `false` 关闭 |
