@@ -845,9 +845,18 @@ function cookiePrefix(t) {
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
   stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
-  // 透明模式：不补 base、不改写、不注入，完全原样转发
+  // 透明模式：不改写响应、不注入内容（仅追加退出按钮）。
+  // 但用户显式填写的路径前缀（base）必须保留：否则 /lucky 这类部署会被丢掉，
+  // 请求落到上游根路径，表现为「打开的是另一个页面 / 目标服务器默认页」。
   if (target.mode === 'transparent') {
     req.__gate_transparent = true;
+    if (target.base) {
+      const { path, query } = splitUrl(req.url);
+      // 已经带该前缀的不重复叠加（浏览器可能直接请求 /lucky/xxx）
+      req.url = (path === target.base.replace(/\/$/, '') || path.startsWith(target.base)
+        ? path
+        : joinBase(target.base, path)) + query;
+    }
     prepareProxyReqHook(req, target);
     proxy.web(req, res, {
       target: targetOrigin(target),
@@ -1048,12 +1057,19 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   if (PROXY_LOG) {
     console.log(`[${tag}] ${req.method} ${req.originalUrl} => ${proxyRes.statusCode} (${proxyRes.headers['content-type'] || '-'})`);
   }
-  // 透明模式 + 注入开关：仅对 HTML 追加一个退出按钮，其余响应全部原样
+  // 透明模式 + 注入开关：对**文本类**响应追加退出按钮，其余原样。
+  // 注意：不仅要覆盖 text/html，也要覆盖上游返回的「纯文本错误页」
+  // （例如 Lucky 的默认页 "Are you ok?"、Nginx 的 404 文本）。
+  // 否则一旦目标报错，用户既看不到内容、也没有退出按钮，彻底卡住。
   if (req.__gate_transparent && INJECT_EXIT && !req.__pf_port) {
     const ctype = String(proxyRes.headers['content-type'] || '');
     const status = proxyRes.statusCode || 200;
     const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
-    if (!noBody && req.method !== 'HEAD' && /text\/html/i.test(ctype)) {
+    const injectable = /text\/html/i.test(ctype) ||
+      (/^(?:text\/plain|text\/[a-z0-9.+-]+)/i.test(ctype) && !/text\/css|text\/javascript/i.test(ctype)) ||
+      // 上游没给 content-type 时，也按可注入处理（多为文本）
+      (!ctype && !noBody);
+    if (!noBody && req.method !== 'HEAD' && injectable) {
       return injectOnlyHtml(proxyRes, req, res, req.__gate_target);
     }
   }
@@ -1082,10 +1098,26 @@ function stripMetaCsp(html) {
   );
 }
 
+// 把一个「非 HTML」的文本响应包成最小合法 HTML，以便挂载退出按钮。
+// 仅用于 text/plain、无 content-type 等纯文本场景；HTML 原样传入。
+function wrapPlainTextAsHtml(text) {
+  const esc = String(text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return '<!doctype html><html lang="zh"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>代理响应</title></head>' +
+    '<body style="margin:0;padding:28px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;' +
+    'color:#0f172a;background:#f8fafc;line-height:1.7">' +
+    '<pre style="white-space:pre-wrap;word-break:break-word;margin:0">' + esc + '</pre>' +
+    '</body></html>';
+}
+
 // 透明模式专用：只注入退出按钮，绝不改写其它内容
 function injectOnlyHtml(proxyRes, req, res, target) {
   const headers = { ...proxyRes.headers };
   const enc = String(headers['content-encoding'] || '').toLowerCase();
+  const ctype0 = String(headers['content-type'] || '');
+  const isHtmlDoc = /text\/html/i.test(ctype0);
   // 我们要「收全 → 注入 → 一次性写回」，因此必须改用 Content-Length。
   // 若保留上游的 transfer-encoding: chunked，会出现
   // 「Content-Length can't be present with Transfer-Encoding」协议错误。
@@ -1109,7 +1141,14 @@ function injectOnlyHtml(proxyRes, req, res, target) {
       res.end(buf);
       return;
     }
-    const out = Buffer.from(injectExitButton(stripMetaCsp(body), target, { mode: 'transparent' }), 'utf8');
+    let text = stripMetaCsp(body);
+    // 非 HTML（如目标错误页的纯文本 "Are you ok?"）→ 包成 HTML，
+    // 否则没有 </body> 可挂，用户既看不到内容也没有退出按钮。
+    if (!isHtmlDoc && !/<\/body>/i.test(text)) {
+      text = wrapPlainTextAsHtml(text);
+      headers['content-type'] = 'text/html; charset=utf-8';
+    }
+    const out = Buffer.from(injectExitButton(text, target, { mode: 'transparent' }), 'utf8');
     delete headers['content-encoding'];
     delete headers['content-length'];
     headers['content-length'] = out.length;
