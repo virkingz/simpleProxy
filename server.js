@@ -1074,8 +1074,8 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     }
   }
   // 防共享缓存：代理响应若被 CDN 按 URL 缓存，会导致切换目标串味 / 旧响应固化。
-  // 只覆盖缓存头，其它头（Set-Cookie / Location / Content-Encoding）保持原样。
-  const headers = { ...proxyRes.headers };
+  // 只覆盖缓存头，其它头保持原样；另修正 Set-Cookie 的 Domain 与绝对 Location。
+  const headers = fixPassthroughHeaders({ ...proxyRes.headers }, req.__gate_target);
   delete headers['cache-control'];
   delete headers['expires'];
   delete headers['pragma'];
@@ -1096,6 +1096,59 @@ function stripMetaCsp(html) {
     /<meta[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi,
     ''
   );
+}
+
+/* ---- 透明 / 端口转发模式下的「最小必要头部修正」 ----
+ * 这两处不改响应体，但**必须**修正，否则会出现「登录已过期」或资源绕过网关：
+ *
+ * 1) Set-Cookie 里的 Domain：
+ *    目标是内网 IP（如 192.168.3.1）时，它会下发 `Domain=192.168.3.1` 的 cookie。
+ *    浏览器看到当前站点是网关域名，域不匹配 → **直接拒收该 cookie**
+ *    → 目标每次请求都收不到会话 → 表现为「登录已过期」。
+ *    做法：剥掉 Domain 属性，使其变为「当前站点」的 host-only cookie。
+ *    （同源覆盖场景下这是标准做法；Path/HttpOnly/Secure/SameSite 全部保留。）
+ *
+ * 2) 绝对地址 Location 且指向目标自身：
+ *    目标若 302 到 `http://192.168.3.1/xxx`，浏览器会**直连内网地址**、绕过网关，
+ *    在浏览器侧通常表现为连不上 / 混合内容拦截。
+ *    做法：把「指向目标自身 origin」的绝对 Location 改成相对路径（其余原样）。
+ */
+function pfStripCookieDomain(v) {
+  return String(v).replace(/;\s*Domain=[^;]*/gi, '');
+}
+function rewriteTargetAbsoluteLocation(loc, target) {
+  try {
+    const u = new URL(String(loc));
+    const sameHost = u.hostname === target.host &&
+      (u.port || (u.protocol === 'https:' ? '443' : '80')) === String(target.port);
+    if (!sameHost) return loc;                       // 指向别处：原样保留
+    // 已是目标自身 → 改为相对路径，强制经网关
+    let p = (u.pathname || '/') + (u.search || '') + (u.hash || '');
+    // 若目标挂在子路径下，去掉该前缀（浏览器侧路径不含前缀）
+    if (target.base && p.startsWith(target.base)) {
+      p = '/' + p.slice(target.base.length).replace(/^\/+/, '');
+    }
+    return p || '/';
+  } catch {
+    return loc;
+  }
+}
+// 就地修正直通类响应的头部（Set-Cookie / Location）
+function fixPassthroughHeaders(headers, target) {
+  if (!target) return headers;
+  const sc = headers['set-cookie'];
+  if (sc) {
+    headers['set-cookie'] = Array.isArray(sc)
+      ? sc.map(pfStripCookieDomain)
+      : pfStripCookieDomain(sc);
+  }
+  const loc = headers['location'];
+  if (loc) {
+    headers['location'] = Array.isArray(loc)
+      ? loc.map((l) => rewriteTargetAbsoluteLocation(l, target))
+      : rewriteTargetAbsoluteLocation(loc, target);
+  }
+  return headers;
 }
 
 // 把一个「非 HTML」的文本响应包成最小合法 HTML，以便挂载退出按钮。
@@ -1133,7 +1186,7 @@ function decodeText(buf, contentType) {
 
 // 透明模式专用：只注入退出按钮，绝不改写其它内容
 function injectOnlyHtml(proxyRes, req, res, target) {
-  const headers = { ...proxyRes.headers };
+  const headers = fixPassthroughHeaders({ ...proxyRes.headers }, target);
   const enc = String(headers['content-encoding'] || '').toLowerCase();
   const ctype0 = String(headers['content-type'] || '');
   const isHtmlDoc = /text\/html/i.test(ctype0);
