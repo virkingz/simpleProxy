@@ -16,9 +16,6 @@ services:
     ports:
       # 左边是宿主机端口（浏览器访问用），可通过 .env 的 GATE_PORT 修改
       - "${GATE_PORT:-8080}:8080"
-      # 端口转发模式需要把分配范围也映射出来（默认 20000-20999）。
-      # 若只用「透明代理 / 路径代理」，可保持注释以少开端口。
-      # - "${PORT_FORWARD_START:-20000}-${PORT_FORWARD_END:-20999}:${PORT_FORWARD_START:-20000}-${PORT_FORWARD_END:-20999}"
 
     environment:
       # ⚠ 必须修改：进入网关页面所需的访问令牌
@@ -41,21 +38,10 @@ services:
       MAX_SESSIONS: "${MAX_SESSIONS:-2000}"
       # 排查用：打印「实际转发路径 + 上游状态码」，并给响应加 X-Gate-* 诊断头
       PROXY_LOG: "${PROXY_LOG:-false}"
-      # 通用子路径：静态资源在根路径被上游判 404 时自动探测真实前缀
-      AUTO_SUBPATH: "${AUTO_SUBPATH:-true}"
-      PROBE_TIMEOUT_MS: "${PROBE_TIMEOUT_MS:-1200}"
-      # 代理模式：透明代理（零改写，推荐）与端口转发
-      TRANSPARENT: "${TRANSPARENT:-true}"
-      PORT_FORWARD: "${PORT_FORWARD:-true}"
-      PORT_FORWARD_START: "${PORT_FORWARD_START:-20000}"
-      PORT_FORWARD_END: "${PORT_FORWARD_END:-20999}"
-      PORT_FORWARD_HOST: "${PORT_FORWARD_HOST:-}"
       # 目标做防盗链/Host 校验而返回 403 时保持默认；设为 "false" 可 A/B 对比
       STRIP_CLIENT_HEADERS: "${STRIP_CLIENT_HEADERS:-true}"
       # 前面套 CDN 时必须保持默认值（禁止共享缓存），否则 404 会被 CDN 缓存固化
       CACHE_CONTROL: "${CACHE_CONTROL:-private, no-store, max-age=0, must-revalidate}"
-      # 给 HTML 里的站内资源加会话级参数以绕开 CDN 已缓存的旧 404（转发时自动剥离）
-      BUST_CDN_CACHE: "${BUST_CDN_CACHE:-true}"
 
     volumes:
       # SQLite 数据持久化（保存的地址列表）。删除 ./data 会清空已保存地址

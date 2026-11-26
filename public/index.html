@@ -214,7 +214,7 @@ async function login(target, save, name, note){
   err('e-login', '');
   const { status, data } = await api('/login', {
     method: 'POST',
-    body: { target, save: !!save, name: name || '', note: note || '', mode: 'transparent' },
+    body: { target, save: !!save, name: name || '', note: note || '' },
   });
   if (!auto) { btn.disabled = false; btn.textContent = '登录并代理'; }
   if (status === 200 && data.ok) {

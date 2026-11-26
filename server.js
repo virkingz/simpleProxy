@@ -32,6 +32,8 @@ const PROXY_LOG = process.env.PROXY_LOG === 'true';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 小时无操作过期
 const COOKIE_NAME = '_gate_sid';
 const BASE = '/_gate';
+// 判断请求是否为静态资源（用于还原浏览器原生的请求头：静态请求不带 Origin、必带 Sec-Fetch-*）
+const STATIC_RE = /\.(?:js|mjs|cjs|css|map|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|json|txt|wasm)(?:[?#]|$)/i;
 
 /* ---- Token 防爆破（与「诱饵」模式协同）----
  * 诱饵模式下，**绝不能**用 401/429 这类可区分状态来暴露“token 错了” ——
@@ -132,42 +134,13 @@ const BUILD_ID = (() => {
 const CACHE_CONTROL = process.env.CACHE_CONTROL || 'private, no-store, max-age=0, must-revalidate';
 
 // 缓存破坏：给被代理 HTML 里的站内资源 URL 追加会话级参数。
-// CDN 已缓存的旧 404 不会因源站加 no-store 而消失，但缓存键包含 query，
-// 换 URL 即可立刻回源；网关转发前剥离该参数，目标服务完全无感。
-// 设 BUST_CDN_CACHE=false 可关闭。
-const BUST_CDN_CACHE = process.env.BUST_CDN_CACHE !== 'false';
-const BUST_PARAM = '_gw';
-
 /* ------------------------------------------------------------------ *
- * 端口转发模式（PORT_FORWARD）
+ * 透明代理模式（nginx 风格）—— 唯一工作模式
  *
- * 这是与「路径代理」并存的第二种工作模式，两者取长补短：
- *
- *  · 路径代理（默认）：网关在同一个域名/端口下用路径区分目标，靠改写
- *    HTML/JS 让子资源也走网关。优点是不用额外端口；缺点是要改写内容，
- *    复杂的 SPA（动态 import、内联 worker、绝对 URL、__vite__ 预加载等）
- *    容易出现漏改 → 页面空白。
- *
- *  · 端口转发：登录后网关在宿主机另开一个「专属端口」，把该端口的全部
- *    流量**原样**转给目标（不改写任何 HTML/JS）。浏览器直接访问
- *    http://<网关IP>:<专属端口>/，目标站点看到的自己就是「根路径」，
- *    因此不存在绝对路径错位、也不存在改写遗漏 —— 从根上绕开整类问题。
- *
- * 安全：专属端口同样要求携带网关会话 Cookie，且会话必须已选择目标，
- * 否则返回一个提示页，避免变成开放代理。
- * ------------------------------------------------------------------ */
-const PORT_FORWARD = process.env.PORT_FORWARD !== 'false';   // 是否允许端口转发模式
-const PF_RANGE_START = Math.max(1, parseInt(process.env.PORT_FORWARD_START || '20000', 10) || 20000);
-const PF_RANGE_END = Math.min(65535, parseInt(process.env.PORT_FORWARD_END || '20999', 10) || 20999);
-const PF_HOST = process.env.PORT_FORWARD_HOST || '';        // 展示用的网关可达地址（可选）
-
-/* ------------------------------------------------------------------ *
- * 透明代理模式（TRANSPARENT，nginx 风格）—— 推荐默认
- *
- * 与「路径代理 + 内容改写」的根本区别：**完全不碰响应体**。
- * 不注入退出按钮、不重写 origin、不加 _gw、不去 base。只做三件事：
+ * 与「内容改写式代理」的根本区别：**完全不碰响应体**。
+ * 不重写 origin、不改写资源地址、不去 base。只做三件事：
  *   · 把请求原样转给目标（换 Host）；
- *   · 把上游 Set-Cookie 原样回传（不再改名/去 Domain/改 Path）；
+ *   · 把上游 Set-Cookie 原样回传（不改名/去 Domain/改 Path）；
  *   · 透传状态码与响应头。
  *
  * 为什么这样更不容易白屏：改写 HTML/JS 是「侵入式」的，现代前端
@@ -175,35 +148,14 @@ const PF_HOST = process.env.PORT_FORWARD_HOST || '';        // 展示用的网�
  * 一旦被改错一处就会整页崩。透明转发让目标服务始终认为自己在根路径，
  * 前端拿到的是**一字未改**的原始代码，因此不存在「漏改」。
  *
+ * 登录地址里若带子路径（如 192.168.1.10:8080/lucky/），会作为 base 在
+ * 出站请求时补上 —— 这属于透明代理自身能力，不需要任何内容改写。
+ *
  * HTTPS 说明：网关对外是什么协议就是什么协议，转发时与目标之间按目标
  * 自身的 scheme 建立连接（网关 → 目标 走 http 或 https 均可，可跨协议），
  * 因此不存在「http 页面请求 https 资源」的混合内容问题；目标若用自签
  * 证书，已内置 secure:false 忽略校验。
  * ------------------------------------------------------------------ */
-const TRANSPARENT = process.env.TRANSPARENT !== 'false';   // 是否提供透明模式
-
-/* ------------------------------------------------------------------ *
- * 通用子路径（base path）代理
- *
- * 很多内网服务不是挂在 / 根，而是挂在 /wangzhang/、/web/、/ui/ 这类
- * 前缀下，或者 HTML 里写死根级 /static/... 而文件其实在别的目录。
- * 旧版 normalizeTarget 直接丢掉了 URL 里的 pathname，导致这类服务
- * 一律 404（且 404 来自上游，不是网关、也不是 CDN）。
- *
- * 两层处理：
- *  ① 显式：登录地址带路径时保留为 base，所有出站请求自动补上
- *     （已经带 base 的路径不会重复叠加）；Location 去掉 base，避免前缀越叠越长。
- *  ② 自动：静态资源在上游 404 时，探测目标真实前缀并即时回源；
- *     命中后只对该会话的「静态资源」请求补前缀，不影响页面/API。
- * ------------------------------------------------------------------ */
-const AUTO_SUBPATH = process.env.AUTO_SUBPATH !== 'false';
-const PROBE_TIMEOUT_MS = Math.max(200, Math.min(5000, parseInt(process.env.PROBE_TIMEOUT_MS || '1200', 10) || 1200));
-const DEFAULT_PREFIXES = ['/web', '/ui', '/www', '/h5', '/admin', '/public', '/dist', '/frontend', '/console', '/manage'];
-const STATIC_RE = /\.(?:js|mjs|cjs|css|map|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|json|txt|wasm)(?:[?#]|$)/i;
-// 只对真正的静态文件做 404 探测，避免把 /api/config.json 这类接口也算进去
-const PROBE_ASSET_RE = /\.(?:js|mjs|cjs|css|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|wasm)(?:[?#]|$)/i;
-// 这些段不是「部署前缀」，不能当作 base 候选
-const SKIP_PREFIX_RE = /^(?:static|assets?|js|css|img|images?|fonts?|media|public|dist|build|login|index\.html?|default\.html?|home|api|favicon\.ico)$/i;
 
 /* ------------------------------------------------------------------ *
  * 数据层（SQLite，零原生依赖）
@@ -328,7 +280,6 @@ function enforceSessionLimits() {
     pend.sort((a, b) => a[1] - b[1]);
     const drop = pend.length - MAX_PENDING_SESSIONS;
     for (let i = 0; i < drop; i++) {
-      if (typeof pfRelease === 'function') pfRelease(sessions.get(pend[i][0]));
       sessions.delete(pend[i][0]);
     }
     return;
@@ -343,7 +294,6 @@ function enforceSessionLimits() {
   let need = sessions.size - MAX_SESSIONS;
   for (const [sid] of pending) {
     if (need <= 0) break;
-    if (typeof pfRelease === 'function') pfRelease(sessions.get(sid));
     sessions.delete(sid);
     need--;
   }
@@ -352,7 +302,6 @@ function enforceSessionLimits() {
     for (const [sid] of all) {
       if (need <= 0) break;
       if (!sessions.has(sid)) continue;
-      if (typeof pfRelease === 'function') pfRelease(sessions.get(sid));
       sessions.delete(sid);
       need--;
     }
@@ -387,7 +336,7 @@ function getSession(req, res, create = false) {
   return s || null;
 }
 
-// 只读 sid（供端口转发监听器使用，不创建会话）
+// 只读 sid（不创建会话）
 function readSid(req) {
   const m = /(?:^|;\s*)_gate_sid=([^;]+)/.exec(String(req.headers.cookie || ''));
   return m ? m[1] : null;
@@ -397,7 +346,6 @@ setInterval(() => {
   const now = Date.now();
   for (const [sid, s] of sessions) {
     if (now - s.lastSeen > SESSION_TTL_MS) {
-      if (typeof pfRelease === 'function') pfRelease(s);
       sessions.delete(sid);
     }
   }
@@ -442,8 +390,6 @@ function normalizeTarget(input) {
   const protocol = u.protocol.replace(':', '');
   return {
     protocol, host, port, base,
-    mode: 'path',                    // 运行时由登录参数决定：path | transparent
-    assetPrefix: '',                 // 自动探测到的静态资源前缀（仅会话内有效）
     key: `${protocol}//${host}:${port}${base}`,
   };
 }
@@ -467,27 +413,6 @@ function joinBase(base, path) {
   if (path === b || path === b + '/' || path.startsWith(b + '/')) return path;
   return b + (path.startsWith('/') ? path : '/' + path);
 }
-
-function stripBase(pathname, base) {
-  const b = String(base || '').replace(/\/+$/, '');
-  if (!b) return pathname;
-  if (pathname === b) return '/';
-  if (pathname.startsWith(b + '/')) return '/' + pathname.slice(b.length + 1);
-  return pathname;
-}
-
-// 在 proxy.web 之前把 req.url 改写成目标侧真实路径。
-// base 作用于所有请求；assetPrefix 只作用于静态资源（自动探测结果），
-// 避免把 /login、/api/... 也带偏。
-function mapOutgoingUrl(req, target) {
-  const { path, query } = splitUrl(req.url);
-  let p = path;
-  if (target.base) p = joinBase(target.base, p);
-  else if (target.assetPrefix && PROBE_ASSET_RE.test(path)) p = joinBase(target.assetPrefix, p);
-  req.url = p + query;
-  return req.url;
-}
-
 /* ------------------------------------------------------------------ *
  * 代理实例
  * ------------------------------------------------------------------ */
@@ -509,23 +434,6 @@ proxy.on('error', (err, req, res) => {
     try { res.end(); } catch {}
   }
 });
-
-/* ---- 出站请求：cookie 命名空间隔离 + 抹掉网关来源 + 关闭压缩 ---- */
-// 直接按原始字符串过滤 cookie，不做 decode/encode 往返：
-// 早期实现用 parseCookies 解码后再 encodeURIComponent，会把 token 里的
-// `+` `/` `=` 变成 %2B %2F %3D，目标解析失败 → 403。
-function forwardCookieHeader(raw, prefix) {
-  if (!raw) return null;
-  const keep = [];
-  for (const part of raw.split(';')) {
-    const p = part.trim();
-    const i = p.indexOf('=');
-    if (i < 0) continue;
-    const name = p.slice(0, i);
-    if (name.startsWith(prefix)) keep.push(p.slice(prefix.length));
-  }
-  return keep.length ? keep.join('; ') : null;
-}
 
 // 压缩协商：几乎所有「页面能开、JS/CSS 全 404 (len=146)」都是这个原因 ——
 // 设备（飞牛 fnOS / 部分 Nginx）静态资源只提供 .js.gz / .css.br 预压缩文件，
@@ -562,23 +470,16 @@ function makeDecoder(enc) {
 
 function prepareProxyReq(proxyReq, req, target) {
   // Cookie 处理取决于模式：
-  //  · 透明代理 / 端口转发：**原样透传**。目标自己的会话 cookie（如 token=...）
-  //    必须完整送达，否则目标每次请求都认为未登录 →「登录已过期」。
-  //    这两种模式下响应侧的 Set-Cookie 也是原样回传的，所以浏览器里存的就是
-  //    目标原生的 cookie，直接透传即可闭环。
-  //  · 路径代理：多个目标共用同一域名，必须用前缀隔离，避免 cookie 串味。
-  if (target.mode === 'transparent' || req.__pf_port) {
-    // 只剔除网关自身的会话 cookie（避免泄漏给目标/被目标覆盖），其余原样透传
+  // 透明明代理：Cookie **原样透传**（仅剔除网关自身的会话 cookie）。
+  // 目标自己的会话 cookie（如 token=...）必须完整送达，否则目标每次请求都
+  // 认为未登录 →「登录已过期」。响应侧 Set-Cookie 也原样回传，因此浏览器里
+  // 存的就是目标原生 cookie，直接透传即可闭环。
+  {
     const raw = String(req.headers.cookie || '');
     const kept = raw.split(';').map((s) => s.trim()).filter(Boolean)
       .filter((p) => !p.startsWith(COOKIE_NAME + '='));
     proxyReq.removeHeader('Cookie');
     if (kept.length) proxyReq.setHeader('Cookie', kept.join('; '));
-  } else {
-    const prefix = cookiePrefix(target);
-    const cookies = forwardCookieHeader(req.headers.cookie, prefix);
-    if (cookies) proxyReq.setHeader('Cookie', cookies);
-    else proxyReq.removeHeader('Cookie');
   }
 
   // 页面与资源一律只声明网关能解码的编码（gzip/deflate/br），
@@ -617,404 +518,10 @@ function prepareProxyReq(proxyReq, req, target) {
   }
 }
 
-/* ---- 响应：cookie 命名空间隔离 + Location 重写 + HTML 注入 ---- */
-function handleProxyRes(proxyRes, req, res, target) {
-  const prefix = cookiePrefix(target);
-  const headers = { ...proxyRes.headers };
-
-  // 我们是「收全 → 改写 → 一次性写回」，必须用 Content-Length，
-  // 因此要剔除上游的分块传输头，否则两者冲突会损坏响应。
-  delete headers['transfer-encoding'];
-
-  // 代理响应同样禁止共享缓存：同一 URL 在不同会话可能指向不同目标，
-  // 被 CDN 缓存会导致 404 固化 / 切换目标串味。覆盖上游的
-  // public / s-maxage / immutable / Expires 等缓存指令。
-  delete headers['cache-control'];
-  delete headers['expires'];
-  delete headers['pragma'];
-  delete headers['age'];
-  headers['cache-control'] = CACHE_CONTROL;
-  const vary = String(headers['vary'] || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (!vary.some(v => v.toLowerCase() === 'cookie')) vary.push('Cookie');
-  headers['vary'] = vary.join(', ');
-
-  // Set-Cookie 改名 + 去掉 Domain，统一挂在网关根路径
-  const sc = proxyRes.headers['set-cookie'];
-  if (sc) {
-    headers['set-cookie'] = sc.map((line) => {
-      const m = line.match(/^([^=]+)=/);
-      if (!m) return line;
-      const name = m[1].trim();
-      let rest = line.slice(m[0].length);
-      rest = rest.replace(/;\s*Domain=[^;]*/gi, '');
-      rest = rest.replace(/;\s*Path=[^;]*/gi, '');
-      return `${prefix}${name}=${rest}; Path=/`;
-    });
-  }
-
-  // Location 重写：指回目标自身的绝对地址 → 相对路径
-  const loc = headers['location'];
-  if (loc) {
-    headers['location'] = rewriteLocation(loc, target);
-  }
-
-  const ctype = String(headers['content-type'] || '');
-  const enc = String(headers['content-encoding'] || '').toLowerCase();
-  const status = proxyRes.statusCode || 200;
-  if (PROXY_LOG) {
-    const out = String(req.__gate_out || req.url || '');
-    const upServer = String(proxyRes.headers.server || '-');
-    console.log(`[proxy] ${req.method} ${req.originalUrl} -> ${out} @ ${targetOrigin(target)} => ${status} (server=${upServer}, ${ctype || '-'}, len=${proxyRes.headers['content-length'] ?? 'chunked'})`);
-    // 让浏览器 DevTools 里也能一眼看出「请求到底被转发成了什么路径」
-    res.setHeader('X-Gate-Outgoing', out);
-    res.setHeader('X-Gate-Upstream', String(status));
-  }
-  // 204/304 及 1xx 无响应体，不能改写、也不能注入
-  const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
-
-  // 目标站点若下发 CSP / frame 限制，会拦住网关下的资源，直接去掉
-  delete headers['content-security-policy'];
-  delete headers['content-security-policy-report-only'];
-  if (headers['x-frame-options']) delete headers['x-frame-options'];
-
-  if (noBody || req.method === 'HEAD') {
-    res.writeHead(status, headers);
-    return proxyRes.pipe(res);
-  }
-
-  // 通用子路径兜底：静态资源被「上游」判 4xx 时，探测目标真实前缀并即时回源。
-  // 注意：这里针对的是上游 404（响应里带 Server / X-Arch 等目标自己的头），
-  // 不是网关的 38 字节未登录 404，也不是 CDN 缓存的 145 字节 404。
-  if (AUTO_SUBPATH && !target.base && !target.assetPrefix && !req.__gate_retried &&
-      (target.probeCount || 0) < 3 &&
-      status >= 400 && status < 500 &&
-      PROBE_ASSET_RE.test(String(req.originalUrl || ''))) {
-    req.__gate_retried = true;
-    target.probeCount = (target.probeCount || 0) + 1;
-    return handleStaticFallback(proxyRes, req, res, target, headers, status);
-  }
-
-  const isHtml = /text\/html/i.test(ctype);
-  // 文本类响应体才做 origin 重写（JS 里常硬编码自身 origin）
-  const isTextLike = /(javascript|ecmascript|text\/css|application\/json|text\/plain)/i.test(ctype);
-
-  if (isHtml && INJECT_EXIT) {
-    // 收集 → 解压 → origin 重写 → 注入退出按钮 → 以 identity 回传
-    const chunks = [];
-    proxyRes.on('data', (c) => chunks.push(c));
-    proxyRes.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      const decode = makeDecoder(enc);
-      let body = null;
-      if (decode) {
-        try { body = decode(buf).toString('utf8'); } catch { body = null; }
-      }
-      // 解压失败 / 未知编码：原样透传（保留 content-encoding），绝不改写
-      if (body === null) {
-        headers['content-length'] = buf.length;
-        res.writeHead(proxyRes.statusCode || 200, headers);
-        res.end(buf);
-        return;
-      }
-      const rewrite = buildOriginRewriters(target, req.headers.host);
-      let html = rewrite(body);
-      if (BUST_CDN_CACHE) html = bustCacheUrls(html, sessionTag(req));
-      const out = Buffer.from(injectExitButton(html, target), 'utf8');
-      delete headers['content-encoding'];
-      headers['content-length'] = out.length;
-      res.writeHead(proxyRes.statusCode || 200, headers);
-      res.end(out);
-    });
-    proxyRes.on('error', () => { try { res.end(); } catch {} });
-    return;
-  }
-
-  if (isTextLike && req.method !== 'HEAD') {
-    const rewrite = buildOriginRewriters(target, req.headers.host);
-    const chunks = [];
-    proxyRes.on('data', (c) => chunks.push(c));
-    proxyRes.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      const decode = makeDecoder(enc);
-      let out = null;
-      if (decode) {
-        try {
-          out = Buffer.from(rewrite(decode(buf).toString('utf8')), 'utf8');
-          delete headers['content-encoding'];
-        } catch { out = null; }
-      }
-      // 解压失败 / 未知编码：原样透传，保持 content-encoding 不变
-      if (out === null) out = buf;
-      headers['content-length'] = out.length;
-      res.writeHead(proxyRes.statusCode || 200, headers);
-      res.end(out);
-    });
-    proxyRes.on('error', () => { try { res.end(); } catch {} });
-    return;
-  }
-
-  res.writeHead(proxyRes.statusCode || 200, headers);
-  proxyRes.pipe(res);
-}
-
-/* ------------------------------------------------------------------ *
- * 通用子路径：静态资源 404 自动探测
- * ------------------------------------------------------------------ */
-function bufferToRes(statusCode, headers, buf) {
-  const s = new Readable({
-    read() { this.push(buf); this.push(null); },
-  });
-  s.statusCode = statusCode;
-  s.headers = headers;
-  return s;
-}
-
-// 直接用 node:http(s) 发一次「干净」的 GET 去目标探测路径。
-// 不经过网关那套请求头加工，因此也能绕开设备对 Origin / Sec-Fetch 的校验。
-// opts.follow: 跟随重定向次数（默认 0，探测入口页时用 3）。
-// opts.protocol: 覆盖协议（用于 http/https 交叉探测）。
-// opts.headers: 额外/覆盖的请求头。
-function rawFetch(target, path, req, opts = {}) {
-  const follow = Number.isInteger(opts.follow) ? opts.follow : 0;
-  const proto = opts.protocol || target.protocol;
-
-  const once = (p, left) => new Promise((resolve) => {
-    let settled = false;
-    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
-    const mod = proto === 'https' ? https : http;
-    const base = {
-      host: target.host,
-      port: target.port,
-      path: p,
-      method: 'GET',
-      rejectUnauthorized: false,
-      headers: {
-        host: `${target.host}${target.port ? ':' + target.port : ''}`,
-        'accept-encoding': 'identity',
-        accept: (req && req.headers && req.headers.accept) || '*/*',
-        'user-agent': (req && req.headers && req.headers['user-agent']) || 'simpleproxy-probe',
-        ...(opts.headers || {}),
-      },
-    };
-    const r = mod.request(base, (up) => {
-      const code = up.statusCode || 200;
-      const loc = up.headers['location'];
-      // 3xx 且有 Location：跟随（仅同源，避免探到外站）
-      if (loc && code >= 300 && code < 400 && left > 0) {
-        up.resume();
-        let np = null;
-        try {
-          const u = new URL(loc, `${proto}://${target.host}:${target.port}`);
-          if (u.hostname === target.host) np = u.pathname + u.search;
-        } catch {}
-        if (np) return once(np, left - 1).then(done);
-        return done({ statusCode: code, headers: up.headers, body: Buffer.alloc(0), path: p, location: loc });
-      }
-      const chunks = [];
-      up.on('data', (c) => chunks.push(c));
-      up.on('end', () => {
-        const body = Buffer.concat(chunks);
-        done({
-          statusCode: code,
-          headers: up.headers,
-          body,
-          path: p,
-          location: loc,
-          stream: bufferToRes(code, up.headers, body),
-        });
-      });
-      up.on('error', () => done(null));
-    });
-    r.setTimeout(PROBE_TIMEOUT_MS, () => { r.destroy(); done(null); });
-    r.on('error', () => done(null));
-    r.end();
-  });
-
-  return once(path, follow);
-}
-
-// 按 content-encoding 解码响应体（用于需要读文本的场景；解不开就原样返回）
-function decodeBody(r) {
-  const enc = String((r.headers && r.headers['content-encoding']) || '').toLowerCase();
-  const decode = makeDecoder(enc);
-  if (!decode) return r.body;
-  try { return decode(r.body); } catch { return r.body; }
-}
-
-/* ---- 自请求：让 diag 能验证「经过网关代理」这条路径本身 ----
- * 之前 diag 只直连上游，因此永远看不到代理层的问题。这里让网关请求自己，
- * 完整走一遍「浏览器 → 网关 → 上游 → 改写 → 回写」，把真实链路暴露出来。
- */
-function selfRequest(path, req, ae) {
-  return new Promise((resolve) => {
-    const r = http.request({
-      host: '127.0.0.1', port: PORT, path, method: 'GET',
-      headers: {
-        cookie: String(req.headers.cookie || ''),
-        accept: '*/*',
-        'accept-encoding': ae || 'gzip, deflate, br, zstd',
-        'user-agent': 'simpleproxy-diag',
-      },
-    }, (up) => {
-      const chunks = [];
-      up.on('data', (c) => chunks.push(c));
-      up.on('end', () => resolve({ statusCode: up.statusCode, headers: up.headers, body: Buffer.concat(chunks) }));
-      up.on('error', () => resolve(null));
-    });
-    r.setTimeout(8000, () => { r.destroy(); resolve(null); });
-    r.on('error', () => resolve(null));
-    r.end();
-  });
-}
-
-// 判断响应体是否「像被当成文本输出的二进制垃圾」（压缩字节被当 utf8 回写）。
-// 只对**文本类**资源有意义：图片 / 字体 / ico 等本来就是二进制，
-// 不能用这个指标判定异常（否则 favicon 会被误报）。
-function isTextualType(ct) {
-  return /(javascript|ecmascript|text\/|application\/json|\+json|xml|svg)/i.test(String(ct || ''));
-}
-function sniffBinary(buf, contentType) {
-  const head = buf.slice(0, 120).toString('latin1');
-  if (!isTextualType(contentType)) return { binary: false, textual: false, head };
-  const n = Math.min(buf.length, 256);
-  if (!n) return { binary: false, textual: true, head };
-  let non = 0;
-  for (let i = 0; i < n; i++) {
-    const b = buf[i];
-    if (b !== 9 && b !== 10 && b !== 13 && (b < 32 || b > 126)) non++;
-  }
-  return { binary: non / n > 0.03, textual: true, nonPrintable: non, head };
-}
-
-// 从目标根页面推断它真实挂在哪个前缀下（跳转 Location / <base> / 资源 src）
-async function rootPrefixes(target) {
-  // follow: 3 —— 入口常是 302 → /login，不跟随就拿不到真正引用资源的那个页面
-  const r = await rawFetch(target, '/', null, { follow: 3 });
-  if (!r) return [];
-  const out = [];
-  const add = (seg) => {
-    if (!seg || SKIP_PREFIX_RE.test(String(seg))) return;
-    const p = '/' + String(seg).replace(/^\/+|\/+$/g, '');
-    if (p !== '/' && !out.includes(p)) out.push(p);
-  };
-  if (r.location) {
-    try { add(new URL(r.location, targetOrigin(target)).pathname.split('/').filter(Boolean)[0]); } catch {}
-  }
-  const text = decodeBody(r).toString('utf8');
-  const bm = /<base[^>]+href\s*=\s*["']\/?([^"'\/?#]+)\//i.exec(text);
-  if (bm) add(bm[1]);
-  const re = /(?:src|href)\s*=\s*["']\/?([^"'\/?#]+)\//gi;
-  let m;
-  while ((m = re.exec(text)) && out.length < 8) add(m[1]);
-  return out;
-}
-
-async function buildPrefixCandidates(target, req, path) {
-  const out = [];
-  const add = (seg) => {
-    if (!seg || SKIP_PREFIX_RE.test(String(seg))) return;
-    const p = '/' + String(seg).replace(/^\/+|\/+$/g, '');
-    if (p === '/' || path.startsWith(p + '/') || out.includes(p)) return;
-    out.push(p);
-  };
-  // ① 当前页面所在子路径（Referer=/wangzhang/login -> /wangzhang）
-  try {
-    const ref = new URL(String(req.headers.referer || ''));
-    add(ref.pathname.split('/').filter(Boolean)[0]);
-  } catch {}
-  // ② 目标根页面自己暴露的前缀
-  for (const p of await rootPrefixes(target)) add(p);
-  // ③ 常见部署前缀
-  DEFAULT_PREFIXES.forEach(add);
-  return out.slice(0, 8);
-}
-
-async function probeSubPath(target, req) {
-  const { path, query } = splitUrl(req.originalUrl || '/');
-  const kept = query.replace(/^\?/, '').split('&').filter(p => p && !p.startsWith(BUST_PARAM + '='));
-  const suffix = kept.length ? '?' + kept.join('&') : '';
-  const candidates = await buildPrefixCandidates(target, req, path);
-  const accepts = ['gzip, deflate, br', 'identity'];
-  const attempts = [];
-  // 前缀候选 × accept-encoding：既找路径前缀，也验证「是否只是压缩协商问题」
-  for (const prefix of candidates) {
-    for (const ae of accepts) {
-      attempts.push({ prefix, full: joinBase(prefix, path) + suffix, ae });
-    }
-  }
-  if (attempts.length === 0) return null;
-  const results = await Promise.all(attempts.map(async (a) => {
-    const r = await rawFetch(target, a.full, req, { headers: { 'accept-encoding': a.ae } });
-    if (!r || r.statusCode < 200 || r.statusCode >= 300) return null;
-    // SPA 的 catch-all 常对任意路径回 200 + text/html，那种不是真资源
-    if (/text\/html/i.test(String(r.headers['content-type'] || ''))) return null;
-    r.prefix = a.prefix;
-    r.acceptEncoding = a.ae;
-    return r;
-  }));
-  const hit = results.find(Boolean) || null;
-  // 若同一 URL 只有带 gzip 才 200，说明上游依赖压缩协商：记下偏好压缩
-  if (hit) target.preferGzip = /gzip|br|deflate/i.test(hit.acceptEncoding);
-  return hit;
-}
-
-async function handleStaticFallback(proxyRes, req, res, target, headers, status) {
-  const chunks = [];
-  proxyRes.on('data', (c) => chunks.push(c));
-  const collected = new Promise((resolve) => {
-    proxyRes.on('end', resolve);
-    proxyRes.on('error', resolve);
-  });
-
-  let hit = null;
-  try { hit = await probeSubPath(target, req); }
-  catch (e) { if (PROXY_LOG) console.log('[proxy] subpath probe error:', e.message); }
-  await collected;
-
-  if (hit) {
-    // 只记住「静态资源」前缀，不影响 /login、/api/... 等页面与接口路径
-    target.assetPrefix = hit.prefix;
-    req.__gate_out = hit.path;
-    if (PROXY_LOG) console.log(`[proxy] subpath discovered ${hit.prefix}: ${req.originalUrl} -> ${hit.path}`);
-    return handleProxyRes(hit.stream, req, res, target);
-  }
-
-  const buf = Buffer.concat(chunks);
-  delete headers['content-length'];
-  headers['content-length'] = buf.length;
-  res.writeHead(status, headers);
-  res.end(buf);
-}
-
-function rewriteLocation(loc, target) {
-  try {
-    if (/^https?:\/\//i.test(loc)) {
-      const u = new URL(loc);
-      const sameHost = u.hostname === target.host && (u.port ? parseInt(u.port, 10) : u.protocol === 'https:' ? 443 : 80) === target.port;
-      if (sameHost) return stripBase(u.pathname, target.base) + u.search + u.hash;
-      return loc; // 指向别处则不动
-    }
-    // 目标站内的根相对跳转：把 base 去掉，浏览器才不会把前缀越叠越长
-    if (/^\//.test(loc)) {
-      const { path, query } = splitUrl(loc);
-      return stripBase(path, target.base) + query;
-    }
-    return loc;
-  } catch {
-    return loc;
-  }
-}
-
-function cookiePrefix(t) {
-  const h = crypto.createHash('md5').update(t.key).digest('hex').slice(0, 8);
-  return `t_${h}_`;
-}
-
 /* ------------------------------------------------------------------ *
  * 代理调度
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
-  stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
   stripGateHeaders(res);    // 移除网关自身的安全头，避免污染被代理内容（见函数注释）
   // 诱饵会话：**绝不真正转发**，但要伪装成「上游不可达」（502 错误页）——
   // 这与真实会话遇到目标下线/端口不通时的表现**完全一致**，
@@ -1026,41 +533,25 @@ function doProxy(req, res, target) {
   // 记下「浏览器看到的路径」：Cookie 的默认 Path 要按它推导，
   // 而不是按补了 base 前缀后发往上游的路径（否则过期指令的 Path 会不匹配）。
   req.__gate_visible_path = req.url;
-  // 透明模式：不改写响应、不注入内容（仅追加退出按钮）。
+  // 透明代理：不改写响应、不注入内容（仅追加退出按钮）。
   // 但用户显式填写的路径前缀（base）必须保留：否则 /lucky 这类部署会被丢掉，
   // 请求落到上游根路径，表现为「打开的是另一个页面 / 目标服务器默认页」。
-  if (target.mode === 'transparent') {
-    req.__gate_transparent = true;
-    if (target.base) {
-      const { path, query } = splitUrl(req.url);
-      // 已经带该前缀的不重复叠加（浏览器可能直接请求 /lucky/xxx）
-      req.url = (path === target.base.replace(/\/$/, '') || path.startsWith(target.base)
-        ? path
-        : joinBase(target.base, path)) + query;
-    }
-    prepareProxyReqHook(req, target);
-    proxy.web(req, res, {
-      target: targetOrigin(target),
-      changeOrigin: true,
-      secure: false,
-      selfHandleResponse: true,
-      xfwd: false,
-      headers: { host: `${target.host}${target.port ? ':' + target.port : ''}` },
-    }, (err) => {
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(errorPage(err.message));
-      }
-    });
-    return;
+  req.__gate_transparent = true;
+  if (target.base) {
+    const { path, query } = splitUrl(req.url);
+    // 已经带该前缀的不重复叠加（浏览器可能直接请求 /lucky/xxx）
+    req.url = (path === target.base.replace(/\/$/, '') || path.startsWith(target.base)
+      ? path
+      : joinBase(target.base, path)) + query;
   }
-  req.__gate_out = mapOutgoingUrl(req, target);   // 通用子路径：补上 base / 探测到的前缀
+  req.__gate_out = req.url;
   prepareProxyReqHook(req, target);
   proxy.web(req, res, {
     target: targetOrigin(target),
     changeOrigin: true,
     secure: false,
     selfHandleResponse: true,
+    xfwd: false,
     headers: { host: `${target.host}${target.port ? ':' + target.port : ''}` },
   }, (err) => {
     if (!res.headersSent) {
@@ -1080,10 +571,7 @@ proxy.on('proxyReq', (proxyReq, req) => {
 proxy.on('proxyReqWs', (proxyReq, req) => {
   if (req.__gate_target) prepareProxyReq(proxyReq, req, req.__gate_target);
 });
-proxy.on('proxyRes', (proxyRes, req, res) => {
-  if (req.__pf_port || req.__gate_transparent) return;   // 直通类：交给下方处理器
-  handleProxyRes(proxyRes, req, res, req.__gate_target);
-});
+// 透明代理的响应统一由下方的直通处理器接管（不做任何改写）
 
 /* ------------------------------------------------------------------ *
  * WebSocket 升级处理
@@ -1091,9 +579,13 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 function handleUpgrade(req, socket, head) {
   const s = getSession(req);
   if (!s || !s.target) return socket.destroy();
-  stripBustParam(req);
-  // 透明模式：路径不补前缀，原样转发
-  if (s.target.mode !== 'transparent') req.__gate_out = mapOutgoingUrl(req, s.target);
+  // 与 HTTP 透明代理保持一致：出站路径补上 base（已带则不重复叠加）。
+  if (s.target.base) {
+    const { path, query } = splitUrl(req.url);
+    req.url = (path === s.target.base.replace(/\/$/, '') || path.startsWith(s.target.base)
+      ? path
+      : joinBase(s.target.base, path)) + query;
+  }
   req.__gate_target = s.target;
   proxy.ws(req, socket, head, {
     target: targetOrigin(s.target),
@@ -1103,156 +595,21 @@ function handleUpgrade(req, socket, head) {
   });
 }
 
-/* ------------------------------------------------------------------ *
- * 端口转发引擎
- *
- * 为每个「已登录且选择了目标」的会话分配一个宿主机端口，该端口上收到的
- * 所有 HTTP/WebSocket 流量**原样**转发给目标，不做任何 HTML/JS 改写。
- * 这样目标服务始终认为自己在根路径，绝对 URL、动态 import、worker、
- * __vite__ 预加载等全部天然正确 —— 彻底绕开「改写漏改」这类问题。
- *
- * 端口按需分配（懒创建），会话退出或超时后回收。
- * ------------------------------------------------------------------ */
-const pfServers = new Map();   // port -> { server, sid, target }
-
-function pfGetInfo() {
-  // 返回可对外展示的宿主机地址（尽力而为，失败则回退问号）
-  return PF_HOST;
-}
-
-// 为一个会话启动端口转发监听（幂等）
-async function pfEnsure(session) {
-  if (!PORT_FORWARD || !session || !session.target) return null;
-  // 已分配且目标未变：直接复用
-  if (session.pfPort && pfServers.has(session.pfPort)) {
-    const cur = pfServers.get(session.pfPort);
-    if (cur.target && cur.target.key === session.target.key) return session.pfPort;
-    pfRelease(session);
-  }
-  const taken = new Set(pfServers.keys());
-  for (let p = PF_RANGE_START; p <= PF_RANGE_END; p++) {
-    if (taken.has(p) || p === PORT) continue;
-    const ok = await pfBind(p, session);
-    if (ok) return p;
-  }
-  return null;
-}
-
-// 尝试在 port 上监听；成功返回 true，端口被占用返回 false
-function pfBind(port, session) {
-  return new Promise((resolve) => {
-    const srv = http.createServer((req, res) => pfHandleHttp(req, res, port));
-    srv.on('upgrade', (req, socket, head) => pfHandleUpgrade(req, socket, head, port));
-    srv.on('clientError', (err, socket) => { try { socket.destroy(); } catch {} });
-
-    const onError = () => {
-      srv.removeListener('listening', onListening);
-      try { srv.close(); } catch {}
-      resolve(false);
-    };
-    const onListening = () => {
-      srv.removeListener('error', onError);
-      const rec = { server: srv, sid: session.sid, target: session.target, key: session.target.key };
-      pfServers.set(port, rec);
-      session.pfPort = port;
-      if (PROXY_LOG) console.log(`[portfwd] session ${String(session.sid).slice(0, 8)} -> :${port} => ${targetOrigin(session.target)}`);
-      resolve(true);
-    };
-    srv.once('error', onError);
-    srv.once('listening', onListening);
-    try { srv.listen(port, '0.0.0.0'); } catch { onError(); }
-  });
-}
-
-function pfRelease(session) {
-  if (!session || !session.pfPort) return;
-  const rec = pfServers.get(session.pfPort);
-  if (rec && rec.sid === session.sid) {
-    pfServers.delete(session.pfPort);
-    try { rec.server.close(); } catch {}
-    if (PROXY_LOG) console.log(`[portfwd] released :${session.pfPort}`);
-  }
-  session.pfPort = null;
-}
-
-// 端口上的会话解析：必须带合法 sid 且已选定目标
-function pfResolve(req) {
-  const sid = readSid(req);
-  const s = sid && sessions.get(sid);
-  if (s) s.lastSeen = Date.now();
-  // 注意：诱饵会话这里**照常返回**（不再返回 null）。
-  // 若返回 null，上层会回「未授权访问该转发端口」的 403 页 ——
-  // 与真实会话的转发行为明显不同，又成了判据。改由调用方伪装成「上游不可达」。
-  return s;
-}
-
-function pfDeny(res, reason) {
-  res.writeHead(403, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(`<!doctype html><html lang="zh"><meta charset="utf-8"><title>需要登录</title>
-<body style="font-family:system-ui;padding:40px;line-height:1.7;color:#0f172a;background:#f8fafc">
-<h2 style="margin:0 0 10px">未授权访问该转发端口</h2>
-<p style="color:#475569">${reason}</p>
-<p>请先在网关登录页完成 Token 校验并选择目标服务，再从本端口访问。</p>
-</body></html>`);
-}
-
-function pfHandleHttp(req, res, port) {
-  const s = pfResolve(req);
-  if (!s) return pfDeny(res, '没有有效的网关会话（Cookie 缺失或已过期）。');
-  if (!s.target) return pfDeny(res, '当前会话还没有选择目标服务。');
-  // 诱饵：伪装成「上游不可达」，与真实会话目标下线时一致（绝不能回 403 异议页）
-  if (s.decoy) {
-    res.writeHead(502, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-    return res.end(errorPage('connect ECONNREFUSED (upstream unavailable)'));
-  }
-  const rec = pfServers.get(port);
-  if (rec) rec.target = s.target;         // 目标切换后即时生效
-
-  // 原样转发：不改写、不注入、不剥离任何东西
-  req.url = req.url || '/';
-  req.__pf_port = port;                   // 标记：响应侧直通，不做任何改写
-  req.__gate_session = s;                 // 供响应侧记录目标 Cookie 台账
-  stripGateHeaders(res);                  // 移除网关自身安全头，避免污染被代理内容
-  const t = s.target;
-  proxy.web(req, res, {
-    target: targetOrigin(t),
-    changeOrigin: true,
-    secure: false,
-    selfHandleResponse: true,
-    xfwd: false,
-    headers: { host: `${t.host}${t.port ? ':' + t.port : ''}` },
-  });
-}
-
-function pfHandleUpgrade(req, socket, head, port) {
-  const s = pfResolve(req);
-  if (!s || !s.target) { try { socket.destroy(); } catch {} return; }
-  const t = s.target;
-  proxy.ws(req, socket, head, {
-    target: targetOrigin(t),
-    changeOrigin: true,
-    secure: false,
-    headers: { host: `${t.host}${t.port ? ':' + t.port : ''}` },
-  });
-}
-
-// 端口转发下的响应：直通，不做 Cookie 改名 / Location 重写 / HTML 注入
-/* ---- 直通（端口转发 / 透明代理）：原样回传，不做任何改写 ----
+/* ---- 透明代理：原样回传，不做任何改写 ----
  * 这里是「零改写」的关键：状态码、全部响应头、Set-Cookie、Location、
  * Content-Encoding、分块传输…… 一律原封不动交给浏览器。
  * 唯一例外：透明模式下为了能「退出」，会在 HTML 的 </body> 前追加一个
  * 悬浮按钮（只追加、不改写任何既有内容），可通过 INJECT_EXIT_BUTTON=false 关闭。*/
 proxy.on('proxyRes', (proxyRes, req, res) => {
-  if (!req.__pf_port && !req.__gate_transparent) return;  // 普通路径代理交给原逻辑
-  const tag = req.__pf_port ? 'portfwd' : 'transparent';
+  if (!req.__gate_transparent) return;
   if (PROXY_LOG) {
-    console.log(`[${tag}] ${req.method} ${req.originalUrl} => ${proxyRes.statusCode} (${proxyRes.headers['content-type'] || '-'})`);
+    console.log(`[transparent] ${req.method} ${req.originalUrl} => ${proxyRes.statusCode} (${proxyRes.headers['content-type'] || '-'})`);
   }
   // 透明模式 + 注入开关：对**文本类**响应追加退出按钮，其余原样。
   // 注意：不仅要覆盖 text/html，也要覆盖上游返回的「纯文本错误页」
   // （例如 Lucky 的默认页 "Are you ok?"、Nginx 的 404 文本）。
   // 否则一旦目标报错，用户既看不到内容、也没有退出按钮，彻底卡住。
-  if (req.__gate_transparent && INJECT_EXIT && !req.__pf_port) {
+  if (req.__gate_transparent && INJECT_EXIT) {
     const ctype = String(proxyRes.headers['content-type'] || '');
     const status = proxyRes.statusCode || 200;
     const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
@@ -1291,7 +648,7 @@ function stripMetaCsp(html) {
   );
 }
 
-/* ---- 透明 / 端口转发模式下的「最小必要头部修正」 ----
+/* ---- 透明代理下的「最小必要头部修正」 ----
  * 这两处不改响应体，但**必须**修正，否则会出现「登录已过期」或资源绕过网关：
  *
  * 1) Set-Cookie 里的 Domain：
@@ -1600,18 +957,13 @@ app.get(BASE + '/api/me', (req, res) => {
   res.json({
     ok: true,
     build: BUILD_ID,
-    portForward: PORT_FORWARD,
-    transparent: TRANSPARENT,
-    pfHost: PF_HOST || null,
     authed: !!(s && s.authed),
     hasTarget: !!(s && s.target),
-    pfPort: (s && s.pfPort) || null,
-    mode: (s && s.target && s.target.mode) || null,
     target: s && s.target ? { protocol: s.target.protocol, host: s.target.host, port: s.target.port, base: s.target.base } : null,
   });
 });
 
-/* --- 登录目标 --- */
+/* --- 登录目标（仅透明代理）--- */
 app.post(BASE + '/api/login', async (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
@@ -1619,78 +971,30 @@ app.post(BASE + '/api/login', async (req, res) => {
   const target = normalizeTarget((req.body && req.body.target) || '');
   if (!target) return res.status(400).json({ ok: false, error: '地址格式不正确，示例：192.168.1.10:8080' });
 
-  // 代理模式：transparent（nginx 风格、零改写，默认）/ path（路径代理 + 改写）
-  const reqMode = String((req.body && req.body.mode) || 'transparent');
-  target.mode = reqMode === 'path' ? 'path' : 'transparent';
-
-  // ⚠️ 诱饵会话：**不再靠「没有 target」拒绝** —— 否则 /me 的 hasTarget、
-  // localStorage 保存、mode/pfPort 形状都会成为「token 真假」的判据（已被识破）。
-  // 现在诱饵走**与真实完全相同的代码路径**：写入 s.target（幻影目标），
-  // 一样写库 / 一样尝试分配端口，返回形状逐字段对齐；
-  // 真正的差别只在「转发那一层」—— 见 doProxy / pfHandleHttp 里对 s.decoy 的处理，
+  // ⚠️ 诱饵会话：**不靠「没有 target」拒绝** —— 否则 /me 的 hasTarget 会成为
+  // 「token 真假」的判据。诱饵走**与真实完全相同的代码路径**：写入 s.target，
+  // 一样写库（写影子表），返回形状逐字段对齐；
+  // 真正的差别只在「转发那一层」—— 见 doProxy 里对 s.decoy 的处理，
   // 那里会伪装成「上游不可达」，与真实会话遇到目标下线时的表现一致。
   s.decoy = !!s.decoy;
-  if (s.decoy) {
-    // 幻影目标：指向一个**必然连不上**的保留地址（RFC 5737 TEST-NET-1），
-    // 使「跳转后」的观感 = 目标服务不可达，与真实场景无异。
-    target.phantom = true;
-    s.target = target;
-    s.lastSeen = Date.now();
-    // 与真实分支等量工作：诱饵也「写库」，但写入**影子表**（形状/耗时一致，不污染真实数据）
-    const ds = stmtFor(s);
-    if (req.body && req.body.save) {
-      const name = String(req.body.name || '').trim() || `${target.host}:${target.port}${target.base}`;
-      const note = String(req.body.note || '').trim();
-      try { ds.upsert.run(name, note, target.protocol, target.host, target.port, target.base, Date.now(), Date.now()); } catch {}
-    } else {
-      const dFound = ds.find.get(target.protocol, target.host, target.port, target.base);
-      if (dFound) ds.touch.run(Date.now(), dFound.id);
-    }
-    // 端口模式：诱饵也真实分配一个端口（监听后只回「不可达」页），保持形状一致
-    let dPf = null;
-    if (PORT_FORWARD && req.body && req.body.mode === 'port') {
-      try { dPf = await pfEnsure(s); } catch {}
-      if (!dPf) target.mode = 'path';          // 分配失败同样回退，行为一致
-    } else {
-      pfRelease(s);
-    }
-    return res.json({
-      ok: true,
-      target: { protocol: target.protocol, host: target.host, port: target.port, base: target.base },
-      mode: dPf ? 'port' : target.mode,
-      pfPort: dPf,
-      pfHost: dPf ? PF_HOST : null,
-    });
-  }
-
   s.target = target;
   s.lastSeen = Date.now();
 
+  // 写库（诱饵写影子表：形状/耗时一致，不污染真实数据）
+  const ds = stmtFor(s);
   const now = Date.now();
   if (req.body && req.body.save) {
     const name = String(req.body.name || '').trim() || `${target.host}:${target.port}${target.base}`;
     const note = String(req.body.note || '').trim();
-    stmt.upsert.run(name, note, target.protocol, target.host, target.port, target.base, now, now);
+    try { ds.upsert.run(name, note, target.protocol, target.host, target.port, target.base, now, now); } catch {}
   } else {
-    const found = stmt.find.get(target.protocol, target.host, target.port, target.base);
-    if (found) stmt.touch.run(now, found.id);
-  }
-
-  // 端口转发模式：为会话分配专属端口（可失败，失败则回退路径代理）
-  let pfPort = null;
-  if (PORT_FORWARD && req.body && req.body.mode === 'port') {
-    try { pfPort = await pfEnsure(s); } catch (e) { if (PROXY_LOG) console.log('[portfwd] alloc failed:', e.message); }
-    if (!pfPort) target.mode = 'path';   // 分配失败则回退
-  } else {
-    pfRelease(s);
+    const found = ds.find.get(target.protocol, target.host, target.port, target.base);
+    if (found) ds.touch.run(now, found.id);
   }
 
   res.json({
     ok: true,
     target: { protocol: target.protocol, host: target.host, port: target.port, base: target.base },
-    mode: pfPort ? 'port' : target.mode,   // port | transparent | path
-    pfPort,
-    pfHost: pfPort ? PF_HOST : null,
   });
 });
 
@@ -1703,7 +1007,6 @@ app.post(BASE + '/api/logout', (req, res) => {
   const s = getSession(req);
   let cleared = [];
   if (s) {
-    pfRelease(s);
     // 清目标的登录 Cookie（不碰网关自身的 _gate_sid，保留 Token 门禁）
     cleared = targetClearCookies(s, req);
     s.tgtCookies = [];
@@ -1724,196 +1027,12 @@ app.post(BASE + '/api/exit', (req, res) => {
   const s = sid && sessions.get(sid);
   let cleared = [];
   if (s) {
-    pfRelease(s);
     cleared = targetClearCookies(s, req);
   }
   if (sid) sessions.delete(sid);
   const all = [...cleared, sessionCookie(req, '', 0)];
   res.setHeader('Set-Cookie', all);
   res.json({ ok: true, clearedCookies: cleared.length });
-});
-
-/* --- 诊断：把上游真相一次打出来（需已通过 Token） ---
- * GET /_gate/api/diag[?target=1.2.3.4:443]
- * 返回：入口页真实落点、入口页引用的资源、每个资源在各前缀/协议下的真实状态。
- * 用于定位「上游 404」到底是路径前缀问题、协议问题，还是资源本身不存在。
- */
-app.get(BASE + '/api/diag', async (req, res) => {
-  const s = getSession(req);
-  if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  // 诱饵会话：**照常走完整个 diag 流程**，但把探测目标换成「保证不可达的哨兵地址」
-  // （RFC 5737 TEST-NET-1，192.0.2.0/24，不会被路由）。这样：
-  //  · 返回形状/状态码与真实一致（不因 400 而暴露身份）；
-  //  · 又**无法用它探测内网**（探测对象被强制替换）。
-  let diagTarget;
-  if (s.decoy) {
-    diagTarget = normalizeTarget('192.0.2.1:9');
-  } else {
-    diagTarget = (req.query.target && normalizeTarget(req.query.target)) || s.target;
-  }
-  const t = diagTarget;
-  if (!t) return res.status(400).json({ ok: false, error: '未设置目标' });
-
-  const refs = new Set();
-  const { path: cur } = splitUrl(String(req.query.path || '/login'));
-  const entryPaths = ['/', cur, '/login', '/index.html'];
-  const seenEntry = [];
-
-  for (const p of [...new Set(entryPaths)]) {
-    const r = await rawFetch(t, p, null, { follow: 3 });
-    if (!r) { seenEntry.push({ path: p, error: 'unreachable' }); continue; }
-    seenEntry.push({
-      path: p, landedOn: r.path, status: r.statusCode,
-      server: r.headers.server || null,
-      contentType: r.headers['content-type'] || null,
-      location: r.location || null,
-      bytes: r.body.length,
-    });
-    if (/text\/html/i.test(String(r.headers['content-type'] || ''))) {
-      const html = decodeBody(r).toString('utf8');
-      const re = /(?:src|href)\s*=\s*["']([^"']+)["']/gi;
-      let m;
-      while ((m = re.exec(html))) {
-        const u = m[1].trim();
-        if (!u || /^(?:data:|javascript:|mailto:|blob:|#)/i.test(u)) continue;
-        if (/^https?:\/\//i.test(u)) { try { const x = new URL(u); refs.add(x.pathname + x.search); } catch {} }
-        else if (u.startsWith('/')) refs.add(u);
-      }
-    }
-  }
-
-  const rel = [...refs].slice(0, 6);
-  const prefixes = ['', ...DEFAULT_PREFIXES.slice(0, 3)];
-  const protos = t.protocol === 'https' ? ['https', 'http'] : ['http', 'https'];
-  const probes = [];
-  outer:
-  for (const rp of rel) {
-    const { path: rpPath, query: rpQuery } = splitUrl(rp);
-    const segs = rpPath.split('/').filter(Boolean);
-    const variants = new Set([rpPath]);
-    if (segs.length > 1 && ['static', 'assets'].includes(segs[0])) variants.add('/' + segs.slice(1).join('/'));
-    for (const v of variants) {
-      for (const pf of prefixes) {
-        for (const proto of protos) {
-          // 第三项刻意带 zstd：用于识别「上游在现代浏览器下会回 zstd」的情况
-          for (const ae of ['gzip, deflate, br', 'identity', 'gzip, deflate, br, zstd']) {
-            const full = joinBase(pf, v) + rpQuery;
-            const key = proto + ' ' + full + ' [' + ae + ']';
-            if (probes.some((x) => x.key === key)) continue;
-            const r = await rawFetch(t, full, null, { protocol: proto, headers: { 'accept-encoding': ae } });
-            probes.push({
-              key,
-              proto, url: full, acceptEncoding: ae,
-              status: r ? r.statusCode : null,
-              server: r ? (r.headers.server || null) : null,
-              contentType: r ? (r.headers['content-type'] || null) : null,
-              contentEncoding: r ? (r.headers['content-encoding'] || null) : null,
-              bytes: r ? r.body.length : null,
-            });
-            if (probes.length >= 48) break outer;
-          }
-        }
-      }
-    }
-  }
-
-  // ---- 关键：让 diag 请求「网关自己」，验证真实代理链路 ----
-  // 之前的 diag 只直连上游，看不到代理层；这里完整走一遍代理，
-  // 直接对比「直连上游拿到的资源」与「经网关拿到的资源」是否一致。
-  const okProbe = (p) => p.status >= 200 && p.status < 300 && !/text\/html/i.test(String(p.contentType || ''));
-  const viaProxy = [];
-  for (const rp of rel.slice(0, 4)) {
-    const resp = await selfRequest(rp, req, 'gzip, deflate, br, zstd');
-    if (!resp) { viaProxy.push({ url: rp, error: 'gateway unreachable' }); continue; }
-    const enc = String(resp.headers['content-encoding'] || '').toLowerCase();
-    const ct = resp.headers['content-type'] || null;
-    const sniff = sniffBinary(resp.body, ct);
-    viaProxy.push({
-      url: rp,
-      status: resp.statusCode,
-      contentType: ct,
-      contentEncoding: enc || null,
-      bytes: resp.body.length,
-      bodyLooksBinary: sniff.binary,
-      head: sniff.head.slice(0, 80),
-    });
-  }
-
-  // 找「直连上游 200、但经网关仍失败或（文本资源）变成二进制垃圾」的项 = 代理层 bug
-  const proxyBroken = [];
-  for (const vp of viaProxy) {
-    if (vp.error || !vp.url) continue;
-    if (!isTextualType(vp.contentType)) continue;   // 图片/字体等二进制资源跳过
-    const direct = probes.find((p) => p.url === vp.url && okProbe(p));
-    const proxiedOk = vp.status >= 200 && vp.status < 300;
-    if (proxiedOk && !vp.bodyLooksBinary) continue;              // 代理正常
-    if (direct) proxyBroken.push({ ...vp, directStatus: direct.status, directBytes: direct.bytes });
-    else proxyBroken.push(vp);
-  }
-
-  // ---- 结论判定：优先级 代理层 > 压缩协商 > 前缀 > 协议 > 确实不存在 ----
-  const firstRef = rel[0] || null;
-  let verdict = 'unknown';
-  let conclusion = '';
-  let fix = null;
-
-  if (!rel.length) {
-    verdict = 'no-references';
-    conclusion = '入口页没有解析到任何站内资源引用，无法进一步判定。';
-  } else if (proxyBroken.length) {
-    verdict = 'proxy-path';
-    const one = proxyBroken[0];
-    conclusion = `上游本身可以取到该资源，但「经过网关」后异常：`
-      + `直连 ${one.directStatus ?? '-'}，经网关 ${one.status ?? '-'}`
-      + `${one.bodyLooksBinary ? '，且响应体是二进制垃圾（编码未被正确处理）' : ''}。`
-      + `说明问题在网关的代理/改写环节，而不是路径或目标服务。`;
-    fix = '这是网关自身缺陷，请把完整 JSON 反馈给开发者；临时可设 BUST_CDN_CACHE=false 或 INJECT_EXIT_BUTTON=false 定位是改写还是注入引起。';
-  } else {
-    // ① 原样路径（无前缀）在各编码下的结果
-    const samePath = probes.filter((p) => firstRef && p.url === firstRef);
-    const plain = samePath.find((p) => /identity/i.test(p.acceptEncoding));
-    const compressible = samePath.filter((p) => /gzip|br|deflate/i.test(p.acceptEncoding));
-    const gz = compressible.find((p) => /gzip/i.test(p.acceptEncoding));
-    const zst = samePath.find((p) => /zstd/i.test(p.acceptEncoding));
-    const prefixHit = probes.find((p) => okProbe(p) && p.url !== firstRef);
-    const best = compressible.find(okProbe);
-
-    if (okProbe(gz) && plain && !okProbe(plain)) {
-      verdict = 'accept-encoding';
-      conclusion = `路径与协议都正确，唯一变量是 Accept-Encoding：同一 URL 带 gzip 返回 ${gz.status}，`
-        + `不带（identity）返回 ${plain.status}。目标只提供预压缩静态资源，必须让客户端声明 gzip/br。`;
-      fix = zst && zst.contentEncoding === 'zstd'
-        ? '目标还会对 zstd 优先响应；网关已剥离 zstd 只请求 gzip/deflate/br，无需修改登录地址。'
-        : '网关已自动处理（透传可解码的 Accept-Encoding），无需修改登录地址。拉取最新镜像即可。';
-    } else if (okProbe(gz) || okProbe(plain) || best) {
-      verdict = 'ok';
-      conclusion = '原样路径即可取到资源，无需前缀。若浏览器仍 404，检查是否有其他中间层拦截。';
-    } else if (prefixHit) {
-      verdict = 'prefix';
-      const seg = '/' + prefixHit.url.split('/').filter(Boolean).slice(0, 1).join('/') + '/';
-      conclusion = `原样路径取不到，但 ${prefixHit.proto} ${prefixHit.url} [${prefixHit.acceptEncoding}] 返回 ${prefixHit.status}，差一个部署前缀。`;
-      fix = `把登录地址改成带路径的形式，例如 <IP>:<端口>${seg}`;
-    } else {
-      const allOk = probes.filter(okProbe);
-      verdict = 'not-found';
-      conclusion = '所有前缀 / 协议 / 压缩组合都取不到这些资源，说明该地址下确实没有这些文件（可能换过端口、或需要先登录鉴权后再访问）。';
-      fix = `请核对浏览器直连该服务时的完整地址（协议 + IP + 端口）；若曾登录过，先直连登录一次再回到网关。`;
-    }
-  }
-
-  res.json({
-    ok: true,
-    target: { protocol: t.protocol, host: t.host, port: t.port, base: t.base },
-    entry: seenEntry,
-    references: rel,
-    verdict,
-    conclusion,
-    fix,
-    viaProxy,
-    proxyBroken,
-    winner: probes.find(okProbe) || null,
-    probes,
-  });
 });
 
 /* --- 站点列表 ---
@@ -1986,37 +1105,6 @@ app.use((err, req, res, next) => {
   const code = err && err.status && err.status >= 400 ? err.status : 500;
   res.status(code).type('text/plain; charset=utf-8').send(code === 400 ? 'Bad request.' : 'Server error.');
 });
-
-/* ------------------------------------------------------------------ *
- * CDN 缓存破坏
- * ------------------------------------------------------------------ */
-// 同一会话内稳定、不同会话不同的短标识（不含真实 sid）
-function sessionTag(req) {
-  const m = /(?:^|;\s*)_gate_sid=([^;]+)/.exec(req.headers.cookie || '');
-  // 同时混入 BUILD_ID：升级镜像后 tag 必然改变，旧的坏缓存立即失效
-  return crypto.createHash('md5').update((m ? m[1] : 'anon') + '|' + BUILD_ID).digest('hex').slice(0, 8);
-}
-
-// 只改写「站内」URL（相对路径 / 以 / 开头的绝对路径），外链与伪协议保持原样
-function bustCacheUrls(html, tag) {
-  return html.replace(/\b(src|href|action|poster)\s*=\s*(["'])([^"']+)\2/gi, (all, attr, q, url) => {
-    const u = url.trim();
-    if (!u || /^(?:data:|javascript:|mailto:|blob:|#)/i.test(u)) return all;
-    if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(u)) return all;   // 外链 / 协议相对
-    if (u.includes(BUST_PARAM + '=')) return all;
-    const sep = u.includes('?') ? '&' : '?';
-    return `${attr}=${q}${u}${sep}${BUST_PARAM}=${tag}${q}`;
-  });
-}
-
-// 转发给目标前剥离该参数，目标服务看到的 URL 与原来完全一致
-function stripBustParam(req) {
-  if (!BUST_CDN_CACHE || !req.url) return;
-  const i = req.url.indexOf('?');
-  if (i < 0) return;
-  const kept = req.url.slice(i + 1).split('&').filter(p => !p.startsWith(BUST_PARAM + '='));
-  req.url = req.url.slice(0, i) + (kept.length ? '?' + kept.join('&') : '');
-}
 
 /* ------------------------------------------------------------------ *
  * 页面
@@ -2200,56 +1288,6 @@ function injectExitButton(html, target, opts = {}) {
   if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, script + '</body>');
   if (/<\/html>/i.test(html)) return html.replace(/<\/html>/i, script + '</html>');
   return html + script;
-}
-
-/* ------------------------------------------------------------------ *
- * 响应体 origin 重写
- *
- * 很多 Web 应用（尤其 SPA / 前后端分离）会把「自身 origin」硬编码进
- * HTML 或 JS，例如：
- *   <script src="http://192.168.1.10:19980/static/app.js">
- *   const API = "http://192.168.1.10:19980/api";
- * 浏览器会直连这个内网地址（绕过网关），导致资源 404 / 页面空白。
- * 这里把所有指向目标 origin 的引用改写成相对路径，强制走网关。
- * ------------------------------------------------------------------ */
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function buildOriginRewriters(target, clientHost) {
-  const host = target.host;
-  const port = target.port;
-
-  // 需要覆盖的 authority 写法
-  const authorities = [];
-  if (port) authorities.push(host + ':' + port);
-  authorities.push(host);
-  // 目标写的是本机/容器别名时，同端口下的 127.0.0.1 / localhost 也一并覆盖
-  if (port && /^(127\.0\.0\.1|localhost|0\.0\.0\.0|host\.docker\.internal)$/i.test(host)) {
-    ['127.0.0.1', 'localhost'].forEach((h) => {
-      const a = h + ':' + port;
-      if (!authorities.includes(a)) authorities.push(a);
-    });
-  }
-
-  const alt = authorities.map(escapeRegExp).join('|');
-  // 一次匹配：scheme://authority 或 协议相对 //authority
-  const re = new RegExp(
-    '(https?|wss?):\\/\\/(' + alt + ')(?=[/\\\\\'"\\s)>]|$)|\\/\\/(' + alt + ')(?=[/\\\\\'"\\s)>]|$)',
-    'gi'
-  );
-
-  const gwHost = clientHost || '';
-
-  return (text) =>
-    text.replace(re, (m, scheme) => {
-      // http/https → 丢掉 origin，变成相对路径，强制走网关
-      if (/^https?$/i.test(scheme)) return '';
-      // ws/wss → 指向网关自身（浏览器按当前页协议建立连接）
-      if (/^wss?$/i.test(scheme)) return gwHost ? scheme + '://' + gwHost : '';
-      // 协议相对 //authority → 指向网关自身
-      return gwHost ? '//' + gwHost : '';
-    });
 }
 
 function errorPage(msg) {
