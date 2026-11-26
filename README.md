@@ -2,7 +2,7 @@
 
 [![Build and Push Docker Image](https://github.com/virkingz/simpleProxy/actions/workflows/docker.yml/badge.svg)](https://github.com/virkingz/simpleProxy/actions/workflows/docker.yml)
 
-网页版**导航面板**，同时具备「代理」与「导航」两种形态：
+带 **Token 门禁**的网页版**内网网关**，同时具备「代理」与「导航」两种形态：
 
 - **代理模式**（持有 Token）：输入「内网 IP:端口」，网关把该会话的所有请求**原样代理**到目标地址；
   保存过的地址显示在右侧，可一键登录；退出后回到登录页。
