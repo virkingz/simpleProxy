@@ -35,20 +35,24 @@ const BASE = '/_gate';
 // 判断请求是否为静态资源（用于还原浏览器原生的请求头：静态请求不带 Origin、必带 Sec-Fetch-*）
 const STATIC_RE = /\.(?:js|mjs|cjs|css|map|ico|png|jpe?g|gif|svg|webp|bmp|woff2?|ttf|eot|otf|json|txt|wasm)(?:[?#]|$)/i;
 
-/* ---- Token 防爆破（与「诱饵」模式协同）----
- * 诱饵模式下，**绝不能**用 401/429 这类可区分状态来暴露“token 错了” ——
- * 那等于直接告诉攻击者，诱饵也白做。因此这里改为「静默节流」：
- *   某个 IP 在窗口内尝试过于频繁时，只是**把它拖慢**（人为延迟），
- *   响应内容与形状仍与成功完全一致。
- * 关闭诱饵（AUTH_DECOY=false）时，恢复为「失败 → 指数退避 + 429」。
+/* ---- Token 防爆破 ----
+ * 防爆破策略（简单、诚实、可审计）：
+ *   错误 token → **显式 401**，并按 IP 计数失败；连续失败达阈值后**指数退避**
+ *   （返回 429 + `Retry-After`），把爆破速率压到不可行。
+ *   正确 token → 复位计数。
+ *   token 用**恒定时间比较**，避免时序侧信道。
+ *
+ * 说明（重要）：这里**不再使用「诱饵」**。早期版本让错误 token 也返回与成功
+ * 完全一致的响应，试图让爆破「无法收敛」。但该机制有一个**无法修补**的缺陷：
+ * 一旦登录成功，诱饵会话必须让它「看起来像能正常代理」，否则（恒 502 / 恒跳转）
+ * 攻击者只需「代理一个自己控制的可达地址 + 看状态码」即可 100% 判定 token 真假；
+ * 而真要做到「看起来一样」，就只能让它**真的代理** —— 那等于给了错 token 一个
+ * 可用的开放代理（旁路），比预言机本身更危险。
+ * 因此改为显式 401 + 退避：不隐藏、不误导，安全性来自 **Token 熵值** 本身。
  */
-const AUTH_DECOY = process.env.AUTH_DECOY !== 'false';
 const AUTH_MAX_FAILS = parseInt(process.env.AUTH_MAX_FAILS || '5', 10);
 const AUTH_LOCK_BASE_MS = parseInt(process.env.AUTH_LOCK_BASE_MS || '1000', 10);
 const AUTH_FAIL_WINDOW_MS = parseInt(process.env.AUTH_FAIL_WINDOW_MS || String(15 * 60 * 1000), 10);
-// 静默节流：窗口内尝试次数超过该值后，每次登录延迟（毫秒），逐渐加长
-const AUTH_SILENT_DELAY_MS = parseInt(process.env.AUTH_SILENT_DELAY_MS || '400', 10);
-const AUTH_SILENT_MAX_DELAY_MS = parseInt(process.env.AUTH_SILENT_MAX_DELAY_MS || '4000', 10);
 // 计数：ip -> { fails, firstAt, lockedUntil }
 const authFails = new Map();
 function clientIp(req) {
@@ -72,30 +76,15 @@ function authLockRemaining(req) {
   const left = rec.lockedUntil - Date.now();
   return left > 0 ? left : 0;
 }
-// 静默节流：返回应等待的毫秒数（不暴露任何「你错了」的信号）
-function authThrottleDelay(req) {
-  const rec = authFails.get(clientIp(req));
-  if (!rec || rec.fails < AUTH_MAX_FAILS) return 0;
-  const over = rec.fails - AUTH_MAX_FAILS;
-  return Math.min(AUTH_SILENT_DELAY_MS * Math.pow(2, Math.min(over, 6)), AUTH_SILENT_MAX_DELAY_MS);
-}
 function authNoteFail(req) {
   const ip = clientIp(req);
   const rec = authRec(ip);
   rec.fails++;
-  if (!AUTH_DECOY && rec.fails >= AUTH_MAX_FAILS) {
-    // 非诱饵模式：指数退避（第 N 次超出阈值 → base * 2^(超出次数)，上限 5 分钟）
+  if (rec.fails >= AUTH_MAX_FAILS) {
+    // 指数退避（第 N 次超出阈值 → base * 2^(超出次数)，上限 5 分钟）
     const over = rec.fails - AUTH_MAX_FAILS;
     rec.lockedUntil = Date.now() + Math.min(AUTH_LOCK_BASE_MS * Math.pow(2, over), 5 * 60 * 1000);
   }
-  authFails.set(ip, rec);
-}
-// 诱饵模式专用：记录**每一次尝试**（不论对错），且不因成功而复位。
-// 目的是让节流只反映「请求频率」，与 token 是否正确无关 → 杜绝时序/计数侧信道。
-function authNoteAttempt(req) {
-  const ip = clientIp(req);
-  const rec = authRec(ip);
-  rec.fails++;
   authFails.set(ip, rec);
 }
 function authNoteSuccess(req) { authFails.delete(clientIp(req)); }
@@ -206,22 +195,6 @@ db.exec(`
   }
 }
 
-// 诱饵专用「影子表」：结构与 sites 完全一致，但彼此隔离。
-// 目的：让诱饵会话的保存/列表/PATCH/DELETE 都**真实发生**（耗时、形状与真实一致），
-// 又不会污染真实站点数据，也不泄露真实内网地址。
-db.exec(`CREATE TABLE IF NOT EXISTS sites_decoy (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  name         TEXT    NOT NULL,
-  note         TEXT    NOT NULL DEFAULT '',
-  protocol     TEXT    NOT NULL DEFAULT 'http',
-  host         TEXT    NOT NULL,
-  port         INTEGER,
-  base         TEXT    NOT NULL DEFAULT '',
-  created_at   INTEGER NOT NULL,
-  last_used_at INTEGER,
-  UNIQUE(protocol, host, port, base)
-);`);
-
 const stmt = {
   list: db.prepare('SELECT * FROM sites ORDER BY last_used_at DESC, id DESC'),
   get: db.prepare('SELECT * FROM sites WHERE id = ?'),
@@ -237,24 +210,6 @@ const stmt = {
   find: db.prepare('SELECT * FROM sites WHERE protocol = ? AND host = ? AND port = ? AND base = ?'),
 };
 
-// 影子表同构语句：诱饵会话统一走这里，行为/耗时与真实一致
-const stmtDecoy = {
-  list: db.prepare('SELECT * FROM sites_decoy ORDER BY last_used_at DESC, id DESC'),
-  get: db.prepare('SELECT * FROM sites_decoy WHERE id = ?'),
-  upsert: db.prepare(`
-    INSERT INTO sites_decoy (name, note, protocol, host, port, base, created_at, last_used_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(protocol, host, port, base)
-    DO UPDATE SET name = excluded.name, note = excluded.note, last_used_at = excluded.last_used_at
-  `),
-  touch: db.prepare('UPDATE sites_decoy SET last_used_at = ? WHERE id = ?'),
-  update: db.prepare('UPDATE sites_decoy SET name = ?, note = ?, base = ? WHERE id = ?'),
-  del: db.prepare('DELETE FROM sites_decoy WHERE id = ?'),
-  find: db.prepare('SELECT * FROM sites_decoy WHERE protocol = ? AND host = ? AND port = ? AND base = ?'),
-};
-// 按会话选表：诱饵走影子表，真实走真实表
-function stmtFor(s) { return s && s.decoy ? stmtDecoy : stmt; }
-
 /* ------------------------------------------------------------------ *
  * 会话层（内存）
  * ------------------------------------------------------------------ */
@@ -264,12 +219,12 @@ const sessions = new Map(); // sid -> { authed, target, createdAt, lastSeen }
  * 每次无 Cookie 的 POST /auth 都会新建会话；若不设上限，攻击者可无成本刷爆
  * sessions Map（清理任务 60s 一轮、TTL 12h，回收不及）。
  * 策略：超过软上限时**立即淘汰**最久未活跃的会话，且**优先淘汰未认证**的
- * （诱饵/未完成登录的会话最没有保留价值）。真实已登录会话尽量保留，避免误伤。
+ * （未完成登录的会话最没有保留价值）。已登录会话尽量保留，避免误伤。
  * 硬上限：连同已认证会话一起淘汰，保证内存绝不越界。*/
 const MAX_SESSIONS = Math.max(64, parseInt(process.env.MAX_SESSIONS || '2000', 10) || 2000);
 const MAX_PENDING_SESSIONS = Math.max(32, parseInt(process.env.MAX_PENDING_SESSIONS || '500', 10) || 500);
 
-// 溢出淘汰：先清未认证（含诱饵）中最久未用的，再清全部中最久未用的
+// 溢出淘汰：先清未认证会话中最久未用的，再清全部中最久未用的
 function enforceSessionLimits() {
   if (sessions.size <= MAX_SESSIONS) {
     // 仅在「未认证会话」过多时做一次轻量清理
@@ -327,7 +282,7 @@ function getSession(req, res, create = false) {
     // 先按上限腾位（淘汰最久未活跃 / 优先未认证的），再新建，避免 Map 无界增长
     enforceSessionLimits();
     sid = crypto.randomUUID().replace(/-/g, '');
-    s = { sid, authed: false, decoy: false, target: null, tgtCookies: [], createdAt: Date.now(), lastSeen: Date.now() };
+    s = { sid, authed: false, target: null, tgtCookies: [], createdAt: Date.now(), lastSeen: Date.now() };
     sessions.set(sid, s);
     // HTTPS 时带 Secure；HTTP 直连不带（否则浏览器拒收）
     res.setHeader('Set-Cookie', sessionCookie(req, sid, 43200));
@@ -523,13 +478,6 @@ function prepareProxyReq(proxyReq, req, target) {
  * ------------------------------------------------------------------ */
 function doProxy(req, res, target) {
   stripGateHeaders(res);    // 移除网关自身的安全头，避免污染被代理内容（见函数注释）
-  // 诱饵会话：**绝不真正转发**，但要伪装成「上游不可达」（502 错误页）——
-  // 这与真实会话遇到目标下线/端口不通时的表现**完全一致**，
-  // 因此无法通过「跳转后看到什么」判断 token 真假。
-  if (req.__gate_session && req.__gate_session.decoy) {
-    res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-    return res.end(errorPage('connect ECONNREFUSED (upstream unavailable)'));
-  }
   // 记下「浏览器看到的路径」：Cookie 的默认 Path 要按它推导，
   // 而不是按补了 base 前缀后发往上游的路径（否则过期指令的 Path 会不匹配）。
   req.__gate_visible_path = req.url;
@@ -893,61 +841,47 @@ function stripGateHeaders(res) {
   }
 }
 
+// 会话 Cookie 的 Secure 策略（COOKIE_SECURE）：
+//   auto（默认）：HTTPS 请求才加 Secure，HTTP 直连（内网 192.168.x.x）不加
+//                 —— 否则浏览器会**拒收**带 Secure 的 Cookie，直接登录不上。
+//   true        ：恒加 Secure。**仅在「只通过 HTTPS 访问」的部署下设**，
+//                 若同时保留 HTTP 直连入口，HTTP 下会因拒收而无法登录。
+function cookieSecure(req) {
+  const mode = String(process.env.COOKIE_SECURE || 'auto').toLowerCase();
+  if (mode === 'true' || mode === '1' || mode === 'always') return true;
+  if (mode === 'false' || mode === '0' || mode === 'never') return false;
+  return isHttpsReq(req);   // auto
+}
+
 // 组装会话 Cookie：HTTPS 时附加 Secure（防协议降级被明文携带），
 // HTTP 直连（内网 192.168.x.x）时不加，否则浏览器拒收该 Cookie。
 function sessionCookie(req, sid, maxAge) {
   return `${COOKIE_NAME}=${sid}; Path=/; HttpOnly; SameSite=Lax` +
-    (isHttpsReq(req) ? '; Secure' : '') +
+    (cookieSecure(req) ? '; Secure' : '') +
     `; Max-Age=${maxAge}`;
 }
 
 app.use(BASE + '/static', express.static(path.join(__dirname, 'public'), { index: false }));
 
-/* --- Token 校验（含防爆破 / 诱饵）---
- * 诱饵模式（AUTH_DECOY，默认开）：
- *   任何 token 都返回**完全一致**的响应 —— 状态码、body、Cookie 全同（恒定时间）。
- *   正确的 token → 正常会话；错误的 token → 会话带 decoy 标记，
- *   此后所有「真实代理」动作都被静默拒绝（见 doProxy / pfResolve / /api/login）。
- *   目的：让在线爆破无法通过响应差异判断 token 对错，从而无法收敛。
- * 关闭诱饵时：错误 token 返回 401，且失败达阈值后指数退避。
- */
+/* --- Token 校验（恒定时间比较 + 失败指数退避）--- */
 app.post(BASE + '/api/auth', async (req, res) => {
-  // 非诱饵模式：退避期内直接 429
-  if (!AUTH_DECOY) {
-    const left = authLockRemaining(req);
-    if (left > 0) {
-      res.setHeader('Retry-After', String(Math.ceil(left / 1000)));
-      return res.status(429).json({ ok: false, error: `尝试过于频繁，请 ${Math.ceil(left / 1000)} 秒后重试` });
-    }
+  // 退避期内直接 429（避免爆破）
+  const left = authLockRemaining(req);
+  if (left > 0) {
+    res.setHeader('Retry-After', String(Math.ceil(left / 1000)));
+    return res.status(429).json({ ok: false, error: `尝试过于频繁，请 ${Math.ceil(left / 1000)} 秒后重试` });
   }
   const token = String((req.body && req.body.token) || '');
   const sha = (v) => crypto.createHash('sha256').update(v).digest();
   const ok = crypto.timingSafeEqual(sha(token), sha(TOKEN));   // 恒定时间比较
 
-  // ⚠️ 顺序与「计数语义」都很关键：
-  //  · 先算延迟再记账 —— 否则前一次的正确/错误会影响本次延迟，形成时序预言机。
-  //  · 诱饵模式下**统计每一次尝试**（不论对错）、且成功后**不复位**计数 ——
-  //    否则攻击者可「先猜 G、再送一个错误 W；若 W 变快 ⇒ G 是对的」反推正确 token。
-  //    这样节流状态只取决于「请求频率」，与 token 是否正确**完全无关**。
-  const delay = AUTH_DECOY ? authThrottleDelay(req) : 0;
-  if (AUTH_DECOY) {
-    authNoteAttempt(req);
-  } else if (!ok) {
+  if (!ok) {
     authNoteFail(req);
-  } else {
-    authNoteSuccess(req);
-  }
-  if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-
-  // 非诱饵模式：错误 token 仍返回 401（显式，便于管理员排查）
-  if (!AUTH_DECOY && !ok) {
     return res.status(401).json({ ok: false, error: 'Token 不正确' });
   }
-
-  // 到这里：成功 / 或诱饵。二者下发形状完全一致（Cookie 属性、body 均相同）。
+  authNoteSuccess(req);
   const s = getSession(req, res, true);
   s.authed = true;
-  s.decoy = !ok;
   res.json({ ok: true });
 });
 
@@ -971,25 +905,17 @@ app.post(BASE + '/api/login', async (req, res) => {
   const target = normalizeTarget((req.body && req.body.target) || '');
   if (!target) return res.status(400).json({ ok: false, error: '地址格式不正确，示例：192.168.1.10:8080' });
 
-  // ⚠️ 诱饵会话：**不靠「没有 target」拒绝** —— 否则 /me 的 hasTarget 会成为
-  // 「token 真假」的判据。诱饵走**与真实完全相同的代码路径**：写入 s.target，
-  // 一样写库（写影子表），返回形状逐字段对齐；
-  // 真正的差别只在「转发那一层」—— 见 doProxy 里对 s.decoy 的处理，
-  // 那里会伪装成「上游不可达」，与真实会话遇到目标下线时的表现一致。
-  s.decoy = !!s.decoy;
   s.target = target;
   s.lastSeen = Date.now();
 
-  // 写库（诱饵写影子表：形状/耗时一致，不污染真实数据）
-  const ds = stmtFor(s);
   const now = Date.now();
   if (req.body && req.body.save) {
     const name = String(req.body.name || '').trim() || `${target.host}:${target.port}${target.base}`;
     const note = String(req.body.note || '').trim();
-    try { ds.upsert.run(name, note, target.protocol, target.host, target.port, target.base, now, now); } catch {}
+    stmt.upsert.run(name, note, target.protocol, target.host, target.port, target.base, now, now);
   } else {
-    const found = ds.find.get(target.protocol, target.host, target.port, target.base);
-    if (found) ds.touch.run(now, found.id);
+    const found = stmt.find.get(target.protocol, target.host, target.port, target.base);
+    if (found) stmt.touch.run(now, found.id);
   }
 
   res.json({
@@ -1035,21 +961,17 @@ app.post(BASE + '/api/exit', (req, res) => {
   res.json({ ok: true, clearedCookies: cleared.length });
 });
 
-/* --- 站点列表 ---
- * 诱饵会话不能看到**真实**保存列表（那是全局共享的内网地址，泄露即前功尽弃）。
- * 但也不能「恒返回空」—— 否则「空 vs 非空」又成了判据。
- * 解法：诱饵读写**结构完全相同的影子表**（sites_decoy）：诱饵自己保存的项能列出，
- * 耗时/形状/分页语义与真实一致，但看不到真实数据、也污染不到真实数据。 */
+/* --- 站点列表（全局共享的已保存地址） --- */
 app.get(BASE + '/api/sites', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  res.json({ ok: true, sites: stmtFor(s).list.all() });
+  res.json({ ok: true, sites: stmt.list.all() });
 });
 
 app.delete(BASE + '/api/sites/:id', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  stmtFor(s).del.run(parseInt(req.params.id, 10));
+  stmt.del.run(parseInt(req.params.id, 10));
   res.json({ ok: true });
 });
 
@@ -1057,10 +979,8 @@ app.delete(BASE + '/api/sites/:id', (req, res) => {
 app.patch(BASE + '/api/sites/:id', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  const ds = stmtFor(s);
   const id = parseInt(req.params.id, 10);
-  // 不存在的 id 一律 404 —— 诱饵也走这条，不能用「静默 200」暴露身份
-  const row = ds.get.get(id);
+  const row = stmt.get.get(id);
   if (!row) return res.status(404).json({ ok: false, error: '记录不存在' });
   const name = req.body && req.body.name !== undefined ? String(req.body.name).trim() : row.name;
   const note = req.body && req.body.note !== undefined ? String(req.body.note).trim() : row.note;
@@ -1070,7 +990,7 @@ app.patch(BASE + '/api/sites/:id', (req, res) => {
   if (base === '/') base = '';
   if (base && !/^\/[A-Za-z0-9._~\-%/]*$/.test(base)) return res.status(400).json({ ok: false, error: '子路径格式不正确' });
   try {
-    ds.update.run(name || row.name, note, base, id);
+    stmt.update.run(name || row.name, note, base, id);
   } catch {
     return res.status(409).json({ ok: false, error: '已存在相同地址与子路径的保存项' });
   }

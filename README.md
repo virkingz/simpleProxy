@@ -145,17 +145,15 @@ GATE_PORT=8080                   # 宿主机映射端口
 | `DATA_DIR` | `/data`（镜像内） | SQLite 数据目录 |
 | `INJECT_EXIT_BUTTON` | `true` | 是否向被代理 HTML 注入左上角悬浮退出按钮 |
 | `CLEAR_TARGET_COOKIES_ON_EXIT` | `true` | 退出代理时是否「重置目标登录态」。透明代理下被代理页面自己的登录 Cookie 也存在网关源下；开启后退出时会按台账逐个过期这些 Cookie（含 HttpOnly），并由前端清空同源 `localStorage/sessionStorage/IndexedDB`，使下次代理该服务**和第一次一样要重新登录**。设 `false` 保留登录态 |
-| `AUTH_DECOY` | `true` | **Token 校验诱饵**。开启后：任何（对或错）token 都返回**完全一致**的响应（状态码、body、Cookie 属性全同），且**登录后各端点的行为也与真实会话逐字段对齐**（`/me` 的 `hasTarget`、`/sites` 列表、`PATCH` 的 404……），让在线爆破无法通过任何响应差异判断对错。错误 token 得到的「诱饵会话」表面完全正常，但访问代理内容时只会看到「上游不可达」，且看不到任何真实内网数据。设 `false` 则恢复显式 401 + 失败锁定 |
-| `AUTH_MAX_FAILS` | `5` | 静默节流阈值：窗口内尝试超过该次数后，登录请求被**逐次拉长延迟**（不改变响应内容）。诱饵模式下计数与对错无关，避免时序侧信道 |
-| `AUTH_SILENT_DELAY_MS` | `400` | 静默节流的起始延迟（毫秒），随后指数增长 |
-| `AUTH_SILENT_MAX_DELAY_MS` | `4000` | 静默节流延迟上限（毫秒） |
-| `AUTH_LOCK_BASE_MS` | `1000` | **仅当 `AUTH_DECOY=false`**：失败后的指数退避基准时长（毫秒），上限 5 分钟 |
-| `AUTH_FAIL_WINDOW_MS` | `900000` | 失败/尝试计数窗口（毫秒，默认 15 分钟） |
-| `MAX_PENDING_SESSIONS` | `500` | **未认证会话**（含诱饵）数量上限。超过时按「最久未活跃」即时淘汰。防止无 Cookie 狂刷 `/auth` 撑爆内存 |
+| `AUTH_MAX_FAILS` | `5` | 连续失败达该次数后启动**指数退避**（返回 `429` + `Retry-After`），把爆破速率压到不可行 |
+| `AUTH_LOCK_BASE_MS` | `1000` | 指数退避基准时长（毫秒），第 N 次超出阈值 → `base × 2^N`，上限 5 分钟 |
+| `AUTH_FAIL_WINDOW_MS` | `900000` | 失败计数窗口（毫秒，默认 15 分钟） |
+| `MAX_PENDING_SESSIONS` | `500` | **未认证会话**数量上限。超过时按「最久未活跃」即时淘汰。防止无 Cookie 狂刷 `/auth` 撑爆内存 |
 | `MAX_SESSIONS` | `2000` | 会话总数硬上限。超过时优先淘汰未认证会话，仍超出则连已登录会话一起按最久未用淘汰，保证内存绝不无界增长 |
 | `SECURITY_HEADERS` | `true` | 是否给**网关自身**页面下发安全响应头（`X-Frame-Options: DENY`、CSP、nosniff、Referrer-Policy、HSTS）。**不会加到被代理的内容上**，透明代理「零改写」不受影响 |
 | `HSTS_MAX_AGE` | `15552000` | HSTS 有效期（秒，默认 180 天）。仅在 HTTPS 请求下下发；设 `0` 关闭 |
 | `TRUST_PROXY` | `false` | 网关前有 CDN/反代时设为 `true`，才会采信 `X-Forwarded-For` / `X-Forwarded-Proto`（影响限速取 IP 与 `Secure` 判定、HSTS）。直连内网时保持 `false`，否则这些头可被伪造 |
+| `COOKIE_SECURE` | `auto` | 会话 Cookie 的 `Secure` 策略。`auto`＝仅 HTTPS 请求加；`true`＝恒加。**仅当你的部署只通过 HTTPS 访问时**才设 `true`；若同时保留 HTTP 直连入口（如 `192.168.x.x:端口`），设 `true` 会导致浏览器拒收 Cookie、HTTP 下无法登录 |
 | `STRIP_CLIENT_HEADERS` | `true` | 转发给目标时清洗 `X-Forwarded-*` 并把 `Referer`/`Origin` 伪装成目标自身（仅页面/接口请求；静态资源会还原浏览器原生的 `Sec-Fetch-*` 且不注入 `Origin`）。目标做防盗链/Host 校验返回 403 时保持默认即可；设为 `false` 可 A/B 对比 |
 | `PROXY_LOG` | `false` | 设为 `true` 时打印每个代理请求的**实际转发路径**与上游状态码（`docker logs -f simpleproxy`），并在响应里加 `X-Gate-Outgoing` / `X-Gate-Upstream` 头，DevTools 里可直接看出 404 来自哪一层、路径被改成了什么 |
 | `CACHE_CONTROL` | `private, no-store, max-age=0, must-revalidate` | 所有网关响应（含代理透传）强制使用的缓存头。前面套 CDN 时**必须禁止共享缓存**，否则 404 会被缓存固化。可放宽为 `private, max-age=600`（仍禁 CDN 共享缓存） |
@@ -183,31 +181,27 @@ GATE_PORT=8080                   # 宿主机映射端口
 - 本工具会代理内网服务，**请勿直接暴露在公网**；如需外网访问，建议置于反向代理 + HTTPS + IP 白名单之后
 - 未设置 `TOKEN` 时使用默认值 `changeme`，启动会打印告警，请务必修改
 
-### Token 防爆破（诱饵机制）
+### Token 防爆破
 
-Token 是唯一凭证，因此对**在线爆破**做了专门设计（`AUTH_DECOY`，默认开）：
+Token 是唯一凭证，因此对**在线爆破**做了防爆破设计（简单、诚实、可审计）：
 
-- **响应不可区分**：无论 token 对错，`/_gate/api/auth` 都返回**完全一致**的状态码、body 与 Cookie 属性。
-  攻击者无法用「响应差异」判断是否猜中。
-- **登录后也逐字段对齐**（关键）：诱饵会话**不是一个「空壳」**，而是和真实会话走**完全相同的代码路径**，
-  杜绝用任何响应差异反推 token 真假：
-  - `GET /_gate/api/me` 的 `hasTarget` / `target` 与真实一致；
-  - `POST /_gate/api/login` 返回字段与真实**逐字段相同**；
-  - `GET /_gate/api/sites`：诱饵读写**结构完全相同的影子表**，能列出「自己保存的」项 ——
-    既看不到真实内网地址，也不会因「恒空 vs 非空」暴露；
-  - `PATCH/DELETE /_gate/api/sites/:id`：不存在的 id **同样返回 404**（不用「静默 200」走捷径）。
-- **攻击面只在最后一跳**：诱饵访问代理内容时（根路径 / WebSocket）只会看到
-  **「上游不可达」**，与真实会话遇到目标下线时的响应一致 —— 拿不到任何内网内容，
-  也不会出现「你是诱饵」的破绽。
-- **静默节流**：高频尝试只会被**拉长响应时间**，不返回 401/429，
-  且计数**与 token 对错无关**（成功后也不复位）—— 避免「耗时差异 / 计数变化」形成预言机。
+- **恒定时间比较**：token 用 `crypto.timingSafeEqual(sha256(a), sha256(b))` 比较，避免逐字符比较泄漏的时序侧信道。
+- **显式 401 + 指数退避**：错误 token 返回 `401`，并按 IP 计数失败；连续失败达 `AUTH_MAX_FAILS`（默认 5）后，
+  后续请求返回 **`429` + `Retry-After`**，等待时长指数增长（上限 5 分钟），把爆破速率压到不可行。
+  正确 token 复位计数。
 - **会话数量上限（防内存 DoS）**：每次无 Cookie 的 `POST /auth` 都会新建会话，
   因此对**未认证会话**（`MAX_PENDING_SESSIONS`）和**会话总数**（`MAX_SESSIONS`）设了上限。
   超限时按「最久未活跃」即时淘汰，且**优先淘汰未认证会话**，尽量不误伤正在使用的登录会话。
 
-> 注意：诱饵只是让爆破「不出声、不收敛」，**它不能降低爆破可行性**。
-> 真正的防线是 **Token 的熵值** —— 请使用足够长的随机串，例如 `openssl rand -hex 24`。
-> 一旦 token 被猜中，网关本身就是进入内网的跳板，诱饵对此无能为力。
+> **为什么不用「诱饵」（错误 token 也返回与成功一致的响应）？**
+> 早期版本采用过该机制，但它有一个**无法修补**的缺陷：一旦登录成功，诱饵会话必须让它
+> 「看起来像能正常代理」——否则攻击者只需「代理一个自己控制的可达地址，看是否 502/跳转」
+> 即可 100% 判定 token 真假。而真要做到「看起来一样」，就只能让它**真的代理**，
+> 那等于给了错 token 一个可用的开放代理（整站旁路），比预言机本身危险得多。
+> 因此改为显式 401 + 退避：不隐藏、不误导。
+>
+> 安全性来自 **Token 的熵值** —— 请使用足够长的随机串，例如 `openssl rand -hex 24`。
+> 一旦 token 被猜中，网关本身就是进入内网的跳板。
 
 ### 响应头与 Cookie
 
