@@ -1689,14 +1689,17 @@ function injectExitButton(html, target, opts = {}) {
     '#__gate_exit__{position:fixed;top:10px;left:10px;z-index:2147483647;' +
     'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
     'touch-action:none;user-select:none;-webkit-user-select:none;}' +
-    '#__gate_exit_btn__{display:flex;align-items:center;gap:7px;box-sizing:border-box;' +
+    // 折叠态：28×28 正圆、gap 必须为 0 —— 否则文字 span 宽度虽为 0，
+    // flex 的 gap 仍占位（8px 点 + 7px 间隙），导致圆点被挤出中心。
+    '#__gate_exit_btn__{display:flex;align-items:center;gap:0;box-sizing:border-box;' +
     'width:28px;height:28px;padding:0;justify-content:center;border:0;border-radius:50%;' +
     'background:#111827;color:#fff;font-size:12px;line-height:1;cursor:pointer;' +
     'box-shadow:0 4px 14px rgba(0,0,0,.28);opacity:.92;overflow:hidden;' +
-    'transition:width .18s ease,padding .18s ease,background .15s ease;}' +
-    '#__gate_exit__:hover #__gate_exit_btn__{width:auto;padding:0 12px 0 10px;' +
+    'transition:width .18s ease,padding .18s ease,gap .18s ease,background .15s ease;}' +
+    // 展开态（悬停 / 待确认）：恢复间隙、左对齐
+    '#__gate_exit__:hover #__gate_exit_btn__{width:auto;gap:7px;padding:0 12px 0 10px;' +
     'border-radius:999px;justify-content:flex-start;}' +
-    '#__gate_exit__.__g_armed #__gate_exit_btn__{width:auto;padding:0 12px 0 10px;' +
+    '#__gate_exit__.__g_armed #__gate_exit_btn__{width:auto;gap:7px;padding:0 12px 0 10px;' +
     'border-radius:999px;justify-content:flex-start;background:#b42318;}' +
     '#__gate_exit__ .__g_dot{width:8px;height:8px;border-radius:50%;background:#22c55e;' +
     'flex:0 0 auto;display:inline-block;}' +
