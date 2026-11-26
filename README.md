@@ -92,6 +92,10 @@ docker compose up -d
 > docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 > ```
 
+> **多架构**：CI 发布的是 **`linux/amd64` + `linux/arm64`** 多架构镜像（同一 tag 下的 manifest list），
+> Docker 会按宿主机架构**自动选择**对应镜像 —— 在 x86 服务器、Apple Silicon（M 系芯片）、
+> 树莓派 4/5、各类 arm64 NAS 上都能直接 `docker pull`，无需任何额外参数。
+
 ### 方式二：docker run 直接用镜像
 
 ```bash
