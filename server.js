@@ -254,6 +254,22 @@ db.exec(`
   }
 }
 
+// 诱饵专用「影子表」：结构与 sites 完全一致，但彼此隔离。
+// 目的：让诱饵会话的保存/列表/PATCH/DELETE 都**真实发生**（耗时、形状与真实一致），
+// 又不会污染真实站点数据，也不泄露真实内网地址。
+db.exec(`CREATE TABLE IF NOT EXISTS sites_decoy (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT    NOT NULL,
+  note         TEXT    NOT NULL DEFAULT '',
+  protocol     TEXT    NOT NULL DEFAULT 'http',
+  host         TEXT    NOT NULL,
+  port         INTEGER,
+  base         TEXT    NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER,
+  UNIQUE(protocol, host, port, base)
+);`);
+
 const stmt = {
   list: db.prepare('SELECT * FROM sites ORDER BY last_used_at DESC, id DESC'),
   get: db.prepare('SELECT * FROM sites WHERE id = ?'),
@@ -268,6 +284,24 @@ const stmt = {
   del: db.prepare('DELETE FROM sites WHERE id = ?'),
   find: db.prepare('SELECT * FROM sites WHERE protocol = ? AND host = ? AND port = ? AND base = ?'),
 };
+
+// 影子表同构语句：诱饵会话统一走这里，行为/耗时与真实一致
+const stmtDecoy = {
+  list: db.prepare('SELECT * FROM sites_decoy ORDER BY last_used_at DESC, id DESC'),
+  get: db.prepare('SELECT * FROM sites_decoy WHERE id = ?'),
+  upsert: db.prepare(`
+    INSERT INTO sites_decoy (name, note, protocol, host, port, base, created_at, last_used_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(protocol, host, port, base)
+    DO UPDATE SET name = excluded.name, note = excluded.note, last_used_at = excluded.last_used_at
+  `),
+  touch: db.prepare('UPDATE sites_decoy SET last_used_at = ? WHERE id = ?'),
+  update: db.prepare('UPDATE sites_decoy SET name = ?, note = ?, base = ? WHERE id = ?'),
+  del: db.prepare('DELETE FROM sites_decoy WHERE id = ?'),
+  find: db.prepare('SELECT * FROM sites_decoy WHERE protocol = ? AND host = ? AND port = ? AND base = ?'),
+};
+// 按会话选表：诱饵走影子表，真实走真实表
+function stmtFor(s) { return s && s.decoy ? stmtDecoy : stmt; }
 
 /* ------------------------------------------------------------------ *
  * 会话层（内存）
@@ -929,6 +963,13 @@ function cookiePrefix(t) {
 function doProxy(req, res, target) {
   stripBustParam(req);      // 去掉缓存破坏参数后再转发，目标无感
   stripGateHeaders(res);    // 移除网关自身的安全头，避免污染被代理内容（见函数注释）
+  // 诱饵会话：**绝不真正转发**，但要伪装成「上游不可达」（502 错误页）——
+  // 这与真实会话遇到目标下线/端口不通时的表现**完全一致**，
+  // 因此无法通过「跳转后看到什么」判断 token 真假。
+  if (req.__gate_session && req.__gate_session.decoy) {
+    res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(errorPage('connect ECONNREFUSED (upstream unavailable)'));
+  }
   // 记下「浏览器看到的路径」：Cookie 的默认 Path 要按它推导，
   // 而不是按补了 base 前缀后发往上游的路径（否则过期指令的 Path 会不匹配）。
   req.__gate_visible_path = req.url;
@@ -1086,8 +1127,9 @@ function pfResolve(req) {
   const sid = readSid(req);
   const s = sid && sessions.get(sid);
   if (s) s.lastSeen = Date.now();
-  // 诱饵会话不具备任何真实代理能力（返回 null → 上层按「无有效会话」处理）
-  if (s && s.decoy) return null;
+  // 注意：诱饵会话这里**照常返回**（不再返回 null）。
+  // 若返回 null，上层会回「未授权访问该转发端口」的 403 页 ——
+  // 与真实会话的转发行为明显不同，又成了判据。改由调用方伪装成「上游不可达」。
   return s;
 }
 
@@ -1105,6 +1147,11 @@ function pfHandleHttp(req, res, port) {
   const s = pfResolve(req);
   if (!s) return pfDeny(res, '没有有效的网关会话（Cookie 缺失或已过期）。');
   if (!s.target) return pfDeny(res, '当前会话还没有选择目标服务。');
+  // 诱饵：伪装成「上游不可达」，与真实会话目标下线时一致（绝不能回 403 异议页）
+  if (s.decoy) {
+    res.writeHead(502, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    return res.end(errorPage('connect ECONNREFUSED (upstream unavailable)'));
+  }
   const rec = pfServers.get(port);
   if (rec) rec.target = s.target;         // 目标切换后即时生效
 
@@ -1523,17 +1570,43 @@ app.post(BASE + '/api/login', async (req, res) => {
   const reqMode = String((req.body && req.body.mode) || 'transparent');
   target.mode = reqMode === 'path' ? 'path' : 'transparent';
 
-  // ⚠️ 诱饵会话：响应形状与真实会话**完全一致**（前端会照常跳转到目标地址），
-  // 但绝不写入 s.target —— 于是代理入口取不到目标，浏览器跳过去只会回到登录页。
-  // 同时**不写数据库**：否则爆破者能用保存列表反查/污染真实站点。
+  // ⚠️ 诱饵会话：**不再靠「没有 target」拒绝** —— 否则 /me 的 hasTarget、
+  // localStorage 保存、mode/pfPort 形状都会成为「token 真假」的判据（已被识破）。
+  // 现在诱饵走**与真实完全相同的代码路径**：写入 s.target（幻影目标），
+  // 一样写库 / 一样尝试分配端口，返回形状逐字段对齐；
+  // 真正的差别只在「转发那一层」—— 见 doProxy / pfHandleHttp 里对 s.decoy 的处理，
+  // 那里会伪装成「上游不可达」，与真实会话遇到目标下线时的表现一致。
+  s.decoy = !!s.decoy;
   if (s.decoy) {
+    // 幻影目标：指向一个**必然连不上**的保留地址（RFC 5737 TEST-NET-1），
+    // 使「跳转后」的观感 = 目标服务不可达，与真实场景无异。
+    target.phantom = true;
+    s.target = target;
     s.lastSeen = Date.now();
+    // 与真实分支等量工作：诱饵也「写库」，但写入**影子表**（形状/耗时一致，不污染真实数据）
+    const ds = stmtFor(s);
+    if (req.body && req.body.save) {
+      const name = String(req.body.name || '').trim() || `${target.host}:${target.port}${target.base}`;
+      const note = String(req.body.note || '').trim();
+      try { ds.upsert.run(name, note, target.protocol, target.host, target.port, target.base, Date.now(), Date.now()); } catch {}
+    } else {
+      const dFound = ds.find.get(target.protocol, target.host, target.port, target.base);
+      if (dFound) ds.touch.run(Date.now(), dFound.id);
+    }
+    // 端口模式：诱饵也真实分配一个端口（监听后只回「不可达」页），保持形状一致
+    let dPf = null;
+    if (PORT_FORWARD && req.body && req.body.mode === 'port') {
+      try { dPf = await pfEnsure(s); } catch {}
+      if (!dPf) target.mode = 'path';          // 分配失败同样回退，行为一致
+    } else {
+      pfRelease(s);
+    }
     return res.json({
       ok: true,
       target: { protocol: target.protocol, host: target.host, port: target.port, base: target.base },
-      mode: target.mode,
-      pfPort: null,
-      pfHost: null,
+      mode: dPf ? 'port' : target.mode,
+      pfPort: dPf,
+      pfHost: dPf ? PF_HOST : null,
     });
   }
 
@@ -1615,10 +1688,17 @@ app.post(BASE + '/api/exit', (req, res) => {
 app.get(BASE + '/api/diag', async (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  // 诱饵会话：该接口会按 query 里的地址去**探测内网**（相当于 SSRF 内置工具），
-  // 绝不能让爆破者用它扫内网。返回与真实「未设置目标」一致的中性错误。
-  if (s.decoy) return res.status(400).json({ ok: false, error: '未设置目标' });
-  const t = (req.query.target && normalizeTarget(req.query.target)) || s.target;
+  // 诱饵会话：**照常走完整个 diag 流程**，但把探测目标换成「保证不可达的哨兵地址」
+  // （RFC 5737 TEST-NET-1，192.0.2.0/24，不会被路由）。这样：
+  //  · 返回形状/状态码与真实一致（不因 400 而暴露身份）；
+  //  · 又**无法用它探测内网**（探测对象被强制替换）。
+  let diagTarget;
+  if (s.decoy) {
+    diagTarget = normalizeTarget('192.0.2.1:9');
+  } else {
+    diagTarget = (req.query.target && normalizeTarget(req.query.target)) || s.target;
+  }
+  const t = diagTarget;
   if (!t) return res.status(400).json({ ok: false, error: '未设置目标' });
 
   const refs = new Set();
@@ -1784,21 +1864,20 @@ app.get(BASE + '/api/diag', async (req, res) => {
 });
 
 /* --- 站点列表 ---
- * ⚠️ 该列表是**全局共享**的（保存的内网 IP:端口）。诱饵会话必须看不到它，
- * 否则爆破者一旦拿到诱饵会话，就能直接读走全部真实内网地址 —— 诱饵就白做了。
- * 因此诱饵会话一律返回「空列表」（形状与真实一致，不泄露任何信息）。*/
+ * 诱饵会话不能看到**真实**保存列表（那是全局共享的内网地址，泄露即前功尽弃）。
+ * 但也不能「恒返回空」—— 否则「空 vs 非空」又成了判据。
+ * 解法：诱饵读写**结构完全相同的影子表**（sites_decoy）：诱饵自己保存的项能列出，
+ * 耗时/形状/分页语义与真实一致，但看不到真实数据、也污染不到真实数据。 */
 app.get(BASE + '/api/sites', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  if (s.decoy) return res.json({ ok: true, sites: [] });
-  res.json({ ok: true, sites: stmt.list.all() });
+  res.json({ ok: true, sites: stmtFor(s).list.all() });
 });
 
 app.delete(BASE + '/api/sites/:id', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  if (s.decoy) return res.json({ ok: true });   // 静默成功，不动真实数据
-  stmt.del.run(parseInt(req.params.id, 10));
+  stmtFor(s).del.run(parseInt(req.params.id, 10));
   res.json({ ok: true });
 });
 
@@ -1806,9 +1885,10 @@ app.delete(BASE + '/api/sites/:id', (req, res) => {
 app.patch(BASE + '/api/sites/:id', (req, res) => {
   const s = getSession(req);
   if (!s || !s.authed) return res.status(401).json({ ok: false, error: '未通过 Token 校验' });
-  if (s.decoy) return res.json({ ok: true });   // 诱饵：静默成功，不触碰真实数据
+  const ds = stmtFor(s);
   const id = parseInt(req.params.id, 10);
-  const row = stmt.get.get(id);
+  // 不存在的 id 一律 404 —— 诱饵也走这条，不能用「静默 200」暴露身份
+  const row = ds.get.get(id);
   if (!row) return res.status(404).json({ ok: false, error: '记录不存在' });
   const name = req.body && req.body.name !== undefined ? String(req.body.name).trim() : row.name;
   const note = req.body && req.body.note !== undefined ? String(req.body.note).trim() : row.note;
@@ -1818,7 +1898,7 @@ app.patch(BASE + '/api/sites/:id', (req, res) => {
   if (base === '/') base = '';
   if (base && !/^\/[A-Za-z0-9._~\-%/]*$/.test(base)) return res.status(400).json({ ok: false, error: '子路径格式不正确' });
   try {
-    stmt.update.run(name || row.name, note, base, id);
+    ds.update.run(name || row.name, note, base, id);
   } catch {
     return res.status(409).json({ ok: false, error: '已存在相同地址与子路径的保存项' });
   }
