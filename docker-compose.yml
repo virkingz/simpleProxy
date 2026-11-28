@@ -52,6 +52,11 @@ services:
       STRIP_CLIENT_HEADERS: "${STRIP_CLIENT_HEADERS:-true}"
       # 前面套 CDN 时必须保持默认值（禁止共享缓存），否则 404 会被 CDN 缓存固化
       CACHE_CONTROL: "${CACHE_CONTROL:-private, no-store, max-age=0, must-revalidate}"
+      # 把「指向目标自身的绝对地址」改写成相对路径（默认开）。
+      # 目标按 Host 头拼绝对 URL 时，页面里会出现内网地址（172.17.0.1:7023）→ 浏览器连不上 → 图片全破。
+      REWRITE_SELF_ORIGIN: "${REWRITE_SELF_ORIGIN:-true}"
+      # 需要整页缓冲才能改写的体积上限（字节，默认 8MB），超过则原样透传
+      REWRITE_MAX_BYTES: "${REWRITE_MAX_BYTES:-8388608}"
 
     volumes:
       # SQLite 数据持久化（保存的地址列表）。删除 ./data 会清空已保存地址

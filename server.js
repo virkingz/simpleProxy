@@ -150,15 +150,41 @@ const BUILD_ID = (() => {
 // 例如 private, max-age=600（仍禁止 CDN 共享缓存，允许浏览器本地缓存）。
 const CACHE_CONTROL = process.env.CACHE_CONTROL || 'private, no-store, max-age=0, must-revalidate';
 
+/* ---- 「目标自身绝对地址」改写（默认开）----
+ * 为什么需要它（真实案例）：OmniBox / 部分 Go 服务会**按收到的 Host 头拼绝对 URL**。
+ * 网关转发时把 Host 换成了目标地址（172.17.0.1:7023），于是页面里出现
+ *   <img src="http://172.17.0.1:7023/api/proxy/image-url=...">
+ * 172.17.0.1 是 Docker 网桥地址，**浏览器所在的电脑根本连不通**（也不是给外部用的），
+ * 结果就是「页面能开、图片全破」（DevTools 报 ERR_CONNECTION_TIMED_OUT）。
+ *
+ * 修法：在文本类响应里，把「指向目标自身 origin」的绝对地址改写成相对路径，
+ * 让它回到网关这个源上，由网关继续代理。只改这一种形态，其余内容一字不动：
+ *   http://172.17.0.1:7023/api/x  →  /api/x
+ *   https://172.17.0.1:7023/a.png →  /a.png
+ *   //172.17.0.1:7023/a.png       →  /a.png
+ * 只匹配「Host 与目标完全一致」的地址，因此不会误伤指向其它主机/域名的外链
+ * （外链保持原样，正常工作）。
+ *
+ * 注意：这是本项目「零改写」原则的**一处明确例外**，且只做这一件事 ——
+ * 不改资源路径、不改 Cookie、不注入 origin。REWRITE_SELF_ORIGIN=false 可关闭。
+ */
+const REWRITE_SELF_ORIGIN = process.env.REWRITE_SELF_ORIGIN !== 'false';
+// 需要缓冲后才能改写的响应体积上限（超过则原样透传，宁可不改也不拖垮内存）
+const REWRITE_MAX_BYTES = parseInt(process.env.REWRITE_MAX_BYTES || String(8 * 1024 * 1024), 10);
+
 // 缓存破坏：给被代理 HTML 里的站内资源 URL 追加会话级参数。
 /* ------------------------------------------------------------------ *
  * 透明代理模式（nginx 风格）—— 唯一工作模式
  *
- * 与「内容改写式代理」的根本区别：**完全不碰响应体**。
+ * 与「内容改写式代理」的根本区别：**基本不碰响应体**。
  * 不重写 origin、不改写资源地址、不去 base。只做三件事：
  *   · 把请求原样转给目标（换 Host）；
  *   · 把上游 Set-Cookie 原样回传（不改名/去 Domain/改 Path）；
  *   · 透传状态码与响应头。
+ *
+ * 唯一的例外：把「指向目标自身的绝对地址」改成相对路径（见 REWRITE_SELF_ORIGIN）。
+ * 不做这一步，任何「按 Host 头拼绝对 URL」的目标都会把内网地址泄露给浏览器，
+ * 表现为「页面能开、图片/接口全连不上」。
  *
  * 为什么这样更不容易白屏：改写 HTML/JS 是「侵入式」的，现代前端
  * （Vite 的动态 import、__vite__mapDeps、内联 worker、根绝对路径资源）
@@ -607,31 +633,29 @@ function handleUpgrade(req, socket, head) {
   });
 }
 
-/* ---- 透明代理：原样回传，不做任何改写 ----
- * 这里是「零改写」的关键：状态码、全部响应头、Set-Cookie、Location、
- * Content-Encoding、分块传输…… 一律原封不动交给浏览器。
- * 唯一例外：透明模式下为了能「退出」，会在 HTML 的 </body> 前追加一个
- * 悬浮按钮（只追加、不改写任何既有内容），可通过 INJECT_EXIT_BUTTON=false 关闭。*/
+/* ---- 透明代理：原样回传 ----
+ * 状态码、全部响应头、Set-Cookie、Location、Content-Encoding、分块传输……
+ * 一律原封不动交给浏览器。只有两类情况需要读一遍响应体：
+ *   1) 追加「退出」悬浮按钮（仅 HTML/纯文本，INJECT_EXIT_BUTTON=false 可关）；
+ *   2) 把「指向目标自身的绝对地址」改成相对路径（REWRITE_SELF_ORIGIN=false 可关）
+ *      —— 否则目标会把内网地址写进页面，浏览器直连不到 → 图片/接口全废。
+ * 其余响应（图片、字体、视频、二进制等）仍然零缓冲、直接 pipe。*/
 proxy.on('proxyRes', (proxyRes, req, res) => {
   if (!req.__gate_transparent) return;
+  const ctype = String(proxyRes.headers['content-type'] || '');
+  const status = proxyRes.statusCode || 200;
+  const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
+  const canReadBody = !noBody && req.method !== 'HEAD';
+
   if (PROXY_LOG) {
-    console.log(`[transparent] ${req.method} ${req.originalUrl} => ${proxyRes.statusCode} (${proxyRes.headers['content-type'] || '-'})`);
+    console.log(`[transparent] ${req.method} ${req.originalUrl} => ${status} (${ctype || '-'})`);
   }
-  // 透明模式 + 注入开关：对**文本类**响应追加退出按钮，其余原样。
-  // 注意：不仅要覆盖 text/html，也要覆盖上游返回的「纯文本错误页」
-  // （例如 Lucky 的默认页 "Are you ok?"、Nginx 的 404 文本）。
-  // 否则一旦目标报错，用户既看不到内容、也没有退出按钮，彻底卡住。
-  if (req.__gate_transparent && INJECT_EXIT) {
-    const ctype = String(proxyRes.headers['content-type'] || '');
-    const status = proxyRes.statusCode || 200;
-    const noBody = status === 204 || status === 304 || (status >= 100 && status < 200);
-    const injectable = /text\/html/i.test(ctype) ||
-      (/^(?:text\/plain|text\/[a-z0-9.+-]+)/i.test(ctype) && !/text\/css|text\/javascript/i.test(ctype)) ||
-      // 上游没给 content-type 时，也按可注入处理（多为文本）
-      (!ctype && !noBody);
-    if (!noBody && req.method !== 'HEAD' && injectable) {
-      return injectOnlyHtml(proxyRes, req, res, req.__gate_target);
-    }
+
+  // 两者都关（或该类型既不可注入也不可改写）时不必读响应体，直接 pipe
+  const willInject = INJECT_EXIT && injectableForButton(ctype);
+  const willRewrite = REWRITE_SELF_ORIGIN && rewritableText(ctype);
+  if (canReadBody && (willInject || willRewrite)) {
+    return handleTextResponse(proxyRes, req, res, req.__gate_target, { inject: willInject });
   }
   // 防共享缓存：代理响应若被 CDN 按 URL 缓存，会导致切换目标串味 / 旧响应固化。
   // 只覆盖缓存头，其它头保持原样；另修正 Set-Cookie 的 Domain 与绝对 Location。
@@ -789,51 +813,169 @@ function decodeText(buf, contentType) {
   try { return new TextDecoder(cs).decode(buf); } catch { return buf.toString('utf8'); }
 }
 
-// 透明模式专用：只注入退出按钮，绝不改写其它内容
-function injectOnlyHtml(proxyRes, req, res, target) {
+// 哪些响应要「追加退出按钮」：HTML 与纯文本。
+// 注意：不仅要覆盖 text/html，也要覆盖上游返回的「纯文本错误页」
+// （例如 Lucky 的默认页 "Are you ok?"、Nginx 的 404 文本），
+// 否则一旦目标报错，用户既看不到内容、也没有退出按钮，彻底卡住。
+function injectableForButton(ctype) {
+  const c = String(ctype || '');
+  if (!c) return true;                     // 无类型：多为文本，写回前还会做二进制嗅探
+  if (/text\/html/i.test(c)) return true;
+  if (/^text\//i.test(c) && !/text\/css|text\/javascript|text\/event-stream/i.test(c)) return true;
+  return false;
+}
+
+// 哪些响应可以安全地做「绝对地址 → 相对路径」改写（仅文本类，排除 SSE 流）。
+function rewritableText(ctype) {
+  const c = String(ctype || '').toLowerCase();
+  if (!c) return true;                     // 无类型：写回前做二进制嗅探兜底
+  if (/event-stream/.test(c)) return false;
+  return /^text\//.test(c) || /json|javascript|ecmascript|\+xml/.test(c);
+}
+
+// 粗略判断二进制：前 8KB 出现 NUL 即视为二进制，绝不按文本改写（防止损坏图片等）
+function looksBinary(buf) {
+  return buf.subarray(0, 8192).includes(0);
+}
+
+/* ---- 把「指向目标自身的绝对地址」改写成相对路径 ----
+ * 起因：目标按收到的 Host 头拼绝对 URL，网关换 Host 后页面里就出现了内网地址
+ * （如 http://172.17.0.1:7023/api/proxy/...），浏览器直连不到 → 图片全破。
+ * 只替换 host:port 与目标完全一致的那些地址；指向其它主机的绝对地址原样保留。
+ *
+ * 覆盖的写法：
+ *   http://h:p/x  https://h:p/x  //h:p/x  ws://h:p/ws  wss://h:p/ws
+ *   http:\/\/h:p/x（JS/JSON 里斜杠被转义的写法）
+ *
+ * 两处必须小心：
+ *   · 前面不能紧邻字母/数字/冒号（pre 的 lookbehind）—— 否则会把
+ *     ws://h:p/ws 中间的 //h:p 单独吃掉，变成非法的 ws:/ws；
+ *   · 后面必须是路径/查询/引号/空白等边界 —— 否则 172.17.0.1 会误伤 172.17.0.10。
+ * WebSocket 改写成相对路径是安全的：new WebSocket('/ws') 会按页面地址推导 ws/wss。
+ * 返回 { text, hits } 便于日志统计。
+ */
+function rewriteSelfOrigin(text, target) {
+  if (!target || !target.host) return { text, hits: 0 };
+  const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const hostRe = escRe(String(target.host));
+  const hosts = [];
+  if (target.port) hosts.push(`${hostRe}:${target.port}`);
+  // 默认端口（80/443）时目标可能省略端口
+  if (!target.port || Number(target.port) === 80 || Number(target.port) === 443) hosts.push(hostRe);
+  if (!hosts.length) return { text, hits: 0 };
+
+  const pre = '(?<![\\w:])';                                     // 前面不是字母/数字/冒号
+  const tail = '(?=[/\\\\?#"\'\\s<>()\\[\\]{};,`]|$)';            // 后面是路径或边界
+  const scheme = '(?:(?:https?|wss?):)?';
+  const norm = new RegExp(hosts.map((h) => `${pre}${scheme}//${h}${tail}`).join('|'), 'gi');
+  // 转义写法：http:\/\/h:p
+  const escaped = new RegExp(
+    hosts.map((h) => `${pre}${scheme}\\\\/\\\\/${h}${tail}`).join('|'), 'gi'
+  );
+
+  let hits = 0;
+  const out = String(text)
+    .replace(norm, () => { hits++; return ''; })
+    .replace(escaped, () => { hits++; return ''; });
+  return { text: out, hits };
+}
+
+/* ---- 需要读完整响应体的两条路径：注入退出按钮 / 改写自身绝对地址 ----
+ * 其余响应（图片、字体、视频、SSE、二进制）仍然零缓冲直接 pipe。*/
+function handleTextResponse(proxyRes, req, res, target, opts) {
+  const inject = !!(opts && opts.inject);
   const headers = fixPassthroughHeaders({ ...proxyRes.headers }, target);
   // 记录目标下发的 Cookie（供退出时精确过期，含 HttpOnly）
   ledgerAdd(req.__gate_session, headers['set-cookie'], req.__gate_visible_path || req.url);
   const enc = String(headers['content-encoding'] || '').toLowerCase();
   const ctype0 = String(headers['content-type'] || '');
   const isHtmlDoc = /text\/html/i.test(ctype0);
-  // 我们要「收全 → 注入 → 一次性写回」，因此必须改用 Content-Length。
-  // 若保留上游的 transfer-encoding: chunked，会出现
-  // 「Content-Length can't be present with Transfer-Encoding」协议错误。
+  // 改成「收全 → 改写 → 一次性写回」后必须用 Content-Length：
+  // 若同时保留上游的 transfer-encoding: chunked，会出现协议错误。
   delete headers['transfer-encoding'];
-  // 退出按钮是一段内联脚本；若目标下发了 CSP 且未允许 inline script，
-  // 浏览器会直接拦掉它（按钮就不出现）。这里移除 CSP，保证按钮能执行。
-  delete headers['content-security-policy'];
-  delete headers['content-security-policy-report-only'];
-  if (headers['x-frame-options']) delete headers['x-frame-options'];
+  if (inject) {
+    // 退出按钮是内联脚本；目标若下发 CSP 且未允许 inline script，浏览器会拦掉它
+    delete headers['content-security-policy'];
+    delete headers['content-security-policy-report-only'];
+    if (headers['x-frame-options']) delete headers['x-frame-options'];
+  }
+  // 与直通响应保持一致：禁止共享缓存（否则 CDN 会把改写后的页面按 URL 缓存、
+  // 切换目标时串味）
+  delete headers['cache-control'];
+  delete headers['expires'];
+  delete headers['pragma'];
+  delete headers['age'];
+  headers['cache-control'] = CACHE_CONTROL;
+  const vary = String(headers['vary'] || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!vary.some((v) => v.toLowerCase() === 'cookie')) vary.push('Cookie');
+  headers['vary'] = vary.join(', ');
+
+  const status = proxyRes.statusCode || 200;
   const chunks = [];
-  proxyRes.on('data', (c) => chunks.push(c));
+  let total = 0;
+  let passthrough = false;      // 超过体积上限 → 放弃改写，原样透传
+
+  proxyRes.on('data', (c) => {
+    if (passthrough) return;
+    total += c.length;
+    // HTML 保持原有行为（整页缓冲，页面通常不大）；其它文本类超过上限即放弃改写
+    if (total > REWRITE_MAX_BYTES && !isHtmlDoc) {
+      passthrough = true;
+      chunks.push(c);                       // 触发阈值的这一块也必须写回，否则少字节
+      const head = Buffer.concat(chunks);
+      chunks.length = 0;
+      if (!res.headersSent) res.writeHead(status, headers);
+      res.write(head);
+      proxyRes.pipe(res);
+      return;
+    }
+    chunks.push(c);
+  });
+
   proxyRes.on('end', () => {
+    if (passthrough) return;
     const buf = Buffer.concat(chunks);
+    // 原样写回（不解压、不改写）
+    const writeRaw = () => {
+      headers['content-length'] = buf.length;
+      if (!res.headersSent) res.writeHead(status, headers);
+      res.end(buf);
+    };
     const decode = makeDecoder(enc);
     let raw = null;
     if (decode) { try { raw = decode(buf); } catch { raw = null; } }
-    // 解不开（未知编码）→ 原样透传，宁可不注入也不破坏
-    if (raw === null) {
-      headers['content-length'] = buf.length;
-      res.writeHead(proxyRes.statusCode || 200, headers);
-      res.end(buf);
-      return;
-    }
+    // 解不开（未知编码）→ 原样透传，宁可不改也不破坏内容
+    if (raw === null) return writeRaw();
+    // 声明成文本但实际是二进制（或上游没给 content-type）→ 原样透传
+    if (looksBinary(raw)) return writeRaw();
+
     // 按 content-type 声明的字符集解码（纯文本可能是 gbk，用 utf8 会乱码）
-    let body = decodeText(raw, ctype0);
-    let text = stripMetaCsp(body);
-    // 非 HTML（如目标错误页的纯文本 "Are you ok?"）→ 包成 HTML，
-    // 否则没有 </body> 可挂，用户既看不到内容也没有退出按钮。
-    if (!isHtmlDoc && !/<\/body>/i.test(text)) {
-      text = wrapPlainTextAsHtml(text);
-      headers['content-type'] = 'text/html; charset=utf-8';
+    let text = decodeText(raw, ctype0);
+
+    if (REWRITE_SELF_ORIGIN) {
+      const r = rewriteSelfOrigin(text, target);
+      text = r.text;
+      if (PROXY_LOG && r.hits) {
+        console.log(`[rewrite] ${req.method} ${req.originalUrl}: 目标自身绝对地址 ${r.hits} 处 → 相对路径`);
+      }
     }
-    const out = Buffer.from(injectExitButton(text, target, { mode: 'transparent' }), 'utf8');
+
+    if (inject) {
+      text = stripMetaCsp(text);
+      // 非 HTML（如目标错误页的纯文本 "Are you ok?"）→ 包成 HTML，
+      // 否则没有 </body> 可挂，用户既看不到内容也没有退出按钮。
+      if (!isHtmlDoc && !/<\/body>/i.test(text)) {
+        text = wrapPlainTextAsHtml(text);
+        headers['content-type'] = 'text/html; charset=utf-8';
+      }
+      text = injectExitButton(text, target, { mode: 'transparent' });
+    }
+
+    const out = Buffer.from(text, 'utf8');
     delete headers['content-encoding'];
     delete headers['content-length'];
     headers['content-length'] = out.length;
-    res.writeHead(proxyRes.statusCode || 200, headers);
+    if (!res.headersSent) res.writeHead(status, headers);
     res.end(out);
   });
   proxyRes.on('error', () => { try { res.end(); } catch {} });
